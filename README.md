@@ -64,20 +64,60 @@ Then:
 
 ## Usage
 
-### 1. The happy path stays trivial
+### 1. The happy path stays trivial — *and it composes*
+
+A single call: hand the supervisor a context map + a pure closure, get back a
+stub you `deref`. No retry loop, no try/catch.
 
 ```clojure
 (def sup (c/create-supervisor {:name "llm"}))
 
-;; Hand the supervisor a context map + a pure closure; get a stub back.
 (def f (c/submit sup
                  {:prompt "summarize the meeting"}
                  (fn [] (call-llm "summarize the meeting"))))
 
-;; The entire consumer. No retry loop, no try/catch.
 (str "Report: " @f)
 ;;=> "Report: <completion>"
 ```
+
+But the value isn't in that one line — *real* business logic is rarely one
+call. Here's a document-analysis pipeline: chunk a long document, summarize
+every chunk (dozens of calls, fanned out concurrently), combine the summaries,
+then derive a title and action items from the result.
+
+```clojure
+;; one external call -> a derefable stub
+(defn ask [prompt] (c/submit sup {:prompt prompt} #(call-llm prompt)))
+
+(defn analyze [doc]
+  (let [chunks    (partition-all 2000 doc)                  ; e.g. ~50 chunks
+        ;; fan out: submit every chunk, then deref. They run concurrently on
+        ;; virtual threads; if any one 429s, the whole batch throttles.
+        summaries (->> chunks
+                       (mapv #(ask (str "Summarize:\n" (apply str %))))
+                       (mapv deref))
+        ;; fan in: combine, then derive structured outputs from the overview
+        overview     @(ask (str "Combine these summaries:\n" (str/join "\n\n" summaries)))
+        action-items @(ask (str "Extract action items:\n" overview))
+        title        @(ask (str "Give a one-line title:\n" overview))]
+    {:title title, :overview overview, :action-items action-items}))
+
+(analyze big-document)
+;;=> {:title "...", :overview "...", :action-items "..."}
+```
+
+`analyze` reads like plain synchronous Clojure — `let`, `map`, threading — yet
+every one of those 50-odd calls is, *without a line of plumbing in this code*:
+
+- **retried** with backoff on a transient 503,
+- collectively **throttled** the moment any one is rate-limited,
+- and individually **parkable** if it can't recover — leaving `analyze`
+  blocked at that `deref`, *not* unwound.
+
+Now picture the same pipeline written by hand: a retry loop, shared backoff,
+and a `try/catch` threaded through each of those call sites — and a failure on
+chunk 37 unwinding the stack and discarding the 36 summaries you already paid
+for. *That's* the plumbing the supervisor keeps out of your business logic.
 
 ### 2. Transient failures retry automatically
 
