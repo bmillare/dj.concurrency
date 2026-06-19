@@ -1,5 +1,14 @@
+;; dj.concurrency is intentionally DEPENDENCY-FREE: :deps is empty so the
+;; consuming project picks its own Clojure version. All tooling lives in
+;; dev-only aliases below.
 {:paths ["src"]
  :deps {}
  :aliases
  ;; REPL/dev: pull in dev/ and test/ when they exist.
- {:repl {:extra-paths ["dev" "test"]}}}
+ {:repl {:extra-paths ["dev" "test"]}
+
+  ;; Run the test suite (dev-only deps): clojure -X:test
+  :test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :exec-fn cognitect.test-runner.api/test}}}
