@@ -4,67 +4,13 @@ Smarter futures for Clojure. `dj.concurrency` helps you manage unreliable, async
 
 > Status: early. The core (`dj.concurrency`) is working and tested; the API may still change. Zero runtime dependencies.
 
-## The problem
+## The payoff
 
-Imagine calling an LLM API (or any flaky external service) from the REPL. The *happy path* is easy—send a prompt, get a completion. But in the real world, things get messy quickly:
-
-- The endpoint **randomly drops connections** (503s) → you have to write a retry loop.
-- It **rate-limits you** (429s) → you have to add backoff logic, ideally coordinating across *all* active requests.
-- Something genuinely breaks → your `try/catch` block swallows the context, your REPL session moves on, and you lose the state of the active request you wanted to debug.
-
-Before long, your business logic is buried in retry and throttling code. Worse, a failure deep inside a long chain of requests throws an error and destroys all the work that successfully completed around it. 
-
-## The approach: manageable futures
-
-`dj.concurrency` splits async work into three parts:
-
-1. A **consumer** that just calls `deref` (`@`) on a future and waits for the result.
-2. A **worker** (a Java 21 virtual thread) that runs your function.
-3. A **supervisor** that manages the lifecycle: retries, throttling, parking, and recovery.
-
-Instead of writing retry loops, you give the supervisor a context map and a standard Clojure function. It gives you back a **future**. 
-
-If your function fails, the supervisor handles the retry and throttling rules completely outside of your business logic. If it fails too many times and can't recover, the supervisor **parks** the task. Your consumer safely stays blocked—it *doesn't* crash—allowing you to inspect the context at the REPL, fix the issue, and either retry the work or manually deliver a result. Once you do, the blocked code resumes as if nothing happened.
-
-## Requirements
-
-- **JDK 21+** — uses virtual threads (`Thread/startVirtualThread`).
-- **Clojure 1.11+** — uses `random-uuid`.
-
-The library has **zero dependencies** (`:deps {}`). Dev tooling (a Nix flake + a test runner) is provided if you want to work on this repo itself.
-
-## Installation (deps.edn)
-
-```clojure
-io.github.bmillare/dj.concurrency {:git/sha "<sha>"}
-```
-
-Then require it:
-
-```clojure
-(require '[dj.concurrency :as c])
-```
-
-## Usage
-
-### 1. Write standard, readable code
-
-To make a single call, hand the supervisor your function and a context map. You get back a future that you can `deref`. There are no try/catch blocks or retry loops here.
+Here is a pipeline that takes a long document, breaks it into chunks, summarizes them concurrently, and derives action items:
 
 ```clojure
 (def sup (c/create-supervisor {:name "llm"}))
 
-(def f (c/submit sup
-                 {:prompt "summarize the meeting"}
-                 (fn [] (call-llm "summarize the meeting"))))
-
-(str "Report: " @f)
-;;=> "Report: <completion>"
-```
-
-The real benefit happens when you combine multiple calls. Here is a pipeline that takes a long document, breaks it into chunks, summarizes them concurrently, and derives action items:
-
-```clojure
 ;; A helper that returns a future
 (defn ask [prompt] (c/submit sup {:prompt prompt} #(call-llm prompt)))
 
@@ -91,6 +37,66 @@ This looks like standard, synchronous Clojure code. Yet, behind the scenes, ever
 - **Retried** automatically if it hits a 503 error.
 - **Throttled** collectively if *any* of the calls hit a rate limit.
 - **Parked** safely if it completely fails, leaving `analyze` paused at the `@` symbol rather than crashing and destroying the 49 other successful summaries.
+
+## The approach: manageable futures
+
+`dj.concurrency` splits async work into three parts:
+
+1. A **consumer** that just calls `deref` (`@`) on a future and waits for the result.
+2. A **worker** (a Java 21 virtual thread) that runs your function.
+3. A **supervisor** that manages the lifecycle: retries, throttling, parking, and recovery.
+
+Instead of writing retry loops, you give the supervisor a context map and a standard Clojure function. It gives you back a **future**. 
+
+If your function fails, the supervisor handles the retry and throttling rules completely outside of your business logic. If it fails too many times and can't recover, the supervisor **parks** the task. Your consumer safely stays blocked—it *doesn't* crash—allowing you to inspect the context at the REPL, fix the issue, and either retry the work or manually deliver a result. Once you do, the blocked code resumes as if nothing happened.
+
+## The problem
+
+Imagine calling an LLM API (or any flaky external service) from the REPL. The *happy path* is easy—send a prompt, get a completion. But in the real world, things get messy quickly:
+
+- The endpoint **randomly drops connections** (503s) → you have to write a retry loop.
+- It **rate-limits you** (429s) → you have to add backoff logic, ideally coordinating across *all* active requests.
+- Something genuinely breaks → your `try/catch` block swallows the context, your REPL session moves on, and you lose the state of the active request you wanted to debug.
+
+Before long, your business logic is buried in retry and throttling code. Worse, a failure deep inside a long chain of requests throws an error and destroys all the work that successfully completed around it. 
+
+## Requirements
+
+- **JDK 21+** — uses virtual threads (`Thread/startVirtualThread`).
+- **Clojure 1.11+** — uses `random-uuid`.
+
+The library has **zero dependencies** (`:deps {}`). Dev tooling (a Nix flake + a test runner) is provided if you want to work on this repo itself.
+
+## Installation (deps.edn)
+
+```clojure
+io.github.bmillare/dj.concurrency {:git/sha "<sha>"}
+```
+
+Then require it:
+
+```clojure
+(require '[dj.concurrency :as c])
+```
+
+## Usage
+
+### 1. A single call
+
+To make a single call, hand the supervisor your function and a context map. You get back a future that you can `deref`. There are no try/catch blocks or retry loops here.
+
+```clojure
+(def sup (c/create-supervisor {:name "llm"}))
+
+(def f (c/submit sup
+                 {:prompt "summarize the meeting"}
+                 (fn [] (call-llm "summarize the meeting"))))
+
+(str "Report: " @f)
+;;=> "Report: <completion>"
+```
+
+Combining many of these into a pipeline is where it pays off—see [The payoff](#the-payoff) above.
 
 ### 2. Control retries by throwing data
 
