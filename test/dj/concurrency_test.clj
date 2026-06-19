@@ -60,12 +60,12 @@
            base-state)]
       (is (contains? (dir-types dirs) :execute))
       (is (= :running (get-in state' [:tasks "t1" :status])))
-      (is (= 1 (get-in state' [:tasks "t1" :context :mf/attempts]))
+      (is (= 1 (get-in state' [:tasks "t1" :context ::c/attempts]))
           "attempts is initialized to 1"))))
 
 (deftest success-resolves
   (testing "success on a running task resolves the future"
-    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
+    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
           {dirs :directives state' :state}
           (c/default-policy [:success {:task-id "t1" :result 42 :now 2000}] state)]
       (is (= [:resolve {:task-id "t1" :result 42}] (find-dir dirs :resolve)))
@@ -73,7 +73,7 @@
 
 (deftest transient-failure-schedules-retry
   (testing "a transient failure below max-attempts schedules a backed-off retry"
-    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
+    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
           {dirs :directives state' :state}
           (c/default-policy [:failed {:task-id "t1" :error (ex-info "boom" {})
                                       :now 5000}] state)]
@@ -82,12 +82,12 @@
       (is (= :waiting-retry (get-in state' [:tasks "t1" :status])))
       (is (= 6000 (get-in state' [:tasks "t1" :wake-at]))
           "wake-at = now + 1s backoff for attempt 1")
-      (is (= 2 (get-in state' [:tasks "t1" :context :mf/attempts]))))))
+      (is (= 2 (get-in state' [:tasks "t1" :context ::c/attempts]))))))
 
 (deftest transient-failure-exhausted-parks
   (testing "a transient failure at max-attempts parks the task for REPL recovery"
     (let [state (assoc-in base-state [:tasks "t1"]
-                          (running-task "t1" {:mf/attempts 3 :mf/max-attempts 3}))
+                          (running-task "t1" {::c/attempts 3 ::c/max-attempts 3}))
           {state' :state}
           (c/default-policy [:failed {:task-id "t1" :error (ex-info "boom" {})
                                       :now 5000}] state)]
@@ -95,7 +95,7 @@
 
 (deftest rate-limited-throttles-supervisor
   (testing "a 429 sets a supervisor-wide throttle window"
-    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
+    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
           {state' :state}
           (c/default-policy [:failed {:task-id "t1"
                                       :error (ex-info "rl" {:status 429 :retry-after 3000})
@@ -105,7 +105,7 @@
 
 (deftest fatal-failure-aborts
   (testing "a fatal (business) error aborts immediately, no retry"
-    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
+    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
           {dirs :directives state' :state}
           (c/default-policy [:failed {:task-id "t1"
                                       :error (ex-info "bad input" {:type :business-error})
@@ -125,7 +125,7 @@
 (deftest deadline-scan-drains-due-retry
   (testing "a tick at/after wake-at re-executes a waiting-retry task"
     (let [state (assoc-in base-state [:tasks "t1"]
-                          (assoc (running-task "t1" {:mf/attempts 2})
+                          (assoc (running-task "t1" {::c/attempts 2})
                                  :status :waiting-retry :wake-at 6000))
           {dirs :directives state' :state}
           (c/default-policy [:tick {:now 6000}] state)]
@@ -172,7 +172,7 @@
 (deftest configurable-backoff
   (testing "make-reference-policy threads a custom :backoff-fn into retries"
     (let [policy (c/make-reference-policy {:backoff-fn (fn [_] 50)})
-          state  (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
+          state  (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
           {state' :state}
           (policy [:failed {:task-id "t1" :error (ex-info "boom" {}) :now 1000}] state)]
       (is (= 1050 (get-in state' [:tasks "t1" :wake-at])) "now + custom 50ms backoff"))))
@@ -180,7 +180,7 @@
 (deftest configurable-max-attempts
   (testing "make-reference-policy threads a custom :max-attempts default"
     (let [policy (c/make-reference-policy {:max-attempts 1})
-          state  (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
+          state  (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
           {state' :state}
           (policy [:failed {:task-id "t1" :error (ex-info "boom" {}) :now 1000}] state)]
       (is (= :parked (get-in state' [:tasks "t1" :status]))
@@ -224,7 +224,7 @@
   (testing "an exhausted task parks; deliver-result unblocks the consumer with a mock"
     (let [sup (c/create-supervisor {})]
       (try
-        (let [f (c/submit sup {:endpoint :flaky :mf/max-attempts 1}
+        (let [f (c/submit sup {:endpoint :flaky ::c/max-attempts 1}
                           (fn [] (throw (ex-info "still down" {}))))]
           (is (wait-for #(= :parked (status-of f))) "task parks after exhausting retries")
           (is (seq (c/parked-tasks sup)) "shows up in parked-tasks")
@@ -237,7 +237,7 @@
     (let [sup    (c/create-supervisor {})
           fixed? (atom false)]
       (try
-        (let [f (c/submit sup {:mf/max-attempts 1}
+        (let [f (c/submit sup {::c/max-attempts 1}
                           (fn [] (if @fixed? :ok (throw (ex-info "down" {})))))]
           (is (wait-for #(= :parked (status-of f))))
           (reset! fixed? true)        ;; "hot-reload" the world
@@ -249,7 +249,7 @@
   (testing "stopping the supervisor aborts parked tasks"
     (let [sup (c/create-supervisor {})]
       (try
-        (let [f (c/submit sup {:mf/max-attempts 1}
+        (let [f (c/submit sup {::c/max-attempts 1}
                           (fn [] (throw (ex-info "down" {}))))]
           (is (wait-for #(= :parked (status-of f))))
           (c/stop! sup :abort-pending)

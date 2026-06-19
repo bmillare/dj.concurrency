@@ -94,11 +94,14 @@ By default the reference policy classifies errors as:
 
 - `:fatal` — `ex-data` has `{:type :business-error}` → abort immediately (no retry),
 - `:rate-limited` — `ex-data` has `{:status 429}` → supervisor-wide throttle,
-- `:transient` — anything else → retry up to `:mf/max-attempts` (default 3),
+- `:transient` — anything else → retry up to `:dj.concurrency/max-attempts` (default 3),
   then **park**.
 
-Tune per-task via the context map, e.g. `{:mf/max-attempts 5}`, or set
-supervisor-wide defaults when you create it:
+Per-task tuning keys live in the `dj.concurrency` keyword namespace
+(`:dj.concurrency/max-attempts`; with `(require '[dj.concurrency :as dc])` you can
+write `::dc/max-attempts`). Tune per-task via the context map, e.g.
+`{:dj.concurrency/max-attempts 5}`, or set supervisor-wide defaults when you
+create it:
 
 ```clojure
 (c/create-supervisor {:name        "llm"
@@ -126,7 +129,7 @@ context is preserved), and you debug live:
 ```clojure
 (c/parked-tasks sup)            ; what's stuck?
 (c/task f)                      ; full task map: status, context, the error
-(:context (c/task f))           ;=> {:prompt "draft the release notes", :mf/attempts 1}
+(:context (c/task f))           ;=> {:prompt "draft the release notes", :dj.concurrency/attempts 1}
 (ex-message (:error (c/task f)))
 
 ;; Then choose a recovery, without unwinding the blocked consumer:

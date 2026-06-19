@@ -92,7 +92,7 @@
 
 (defn demo-park-and-recover [sup]
   (say "DEMO D: endpoint stays down -> task parks -> recover from the REPL")
-  (let [f (c/submit sup {:prompt "draft the release notes" :mf/max-attempts 1}
+  (let [f (c/submit sup {:prompt "draft the release notes" ::c/max-attempts 1}
                     (fake-llm "draft the release notes" (atom [:transient])))]
     (wait-for #(= :parked (:status (c/task f))))
     (say "task status:" (:status (c/task f)) "— consumer is still blocked, not crashed")

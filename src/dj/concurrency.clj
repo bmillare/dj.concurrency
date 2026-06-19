@@ -205,7 +205,7 @@
   ;; Design decision RI-12 §5: Stop-then-submit is a programming error.
   ;; Reject immediately at the call site rather than enqueueing.
   (if (:shutdown? @(:state supervisor))
-    (throw (ex-info "Supervisor is stopped or shutting down" {:type :mf/shutdown}))
+    (throw (ex-info "Supervisor is stopped or shutting down" {:type ::shutdown}))
 
     (let [task-id (random-uuid)
           cf      (CompletableFuture.)
@@ -368,7 +368,7 @@
       (if (:shutdown? state)
         ;; S1: Supervisor stopped
         {:directives [[:abort {:task-id task-id
-                               :error (ex-info "supervisor stopped" {:type :mf/shutdown})}]]
+                               :error (ex-info "supervisor stopped" {:type ::shutdown})}]]
          :state state}
 
         (let [throttled? (and (:throttle-expires-at state)
@@ -381,7 +381,7 @@
                                :context (:context payload), :closure (:closure payload)
                                :submitted-at (:submitted-at payload)})}
             ;; S3: Normal Submit
-            (let [ctx' (assoc (:context payload) :mf/attempts 1)]
+            (let [ctx' (assoc (:context payload) ::attempts 1)]
               {:directives [[:execute {:task-id task-id :context ctx' :closure (:closure payload)}]
                             [:log {:level :debug :event :submit-executed :data task-id}]]
                :state (assoc-in state [:tasks task-id]
@@ -414,8 +414,8 @@
 
         (= :running status)
         (let [err-type     ((:classify-error config) (:error payload))
-              attempts     (get-in t [:context :mf/attempts] 1)
-              max-attempts (get-in t [:context :mf/max-attempts] (:max-attempts config))]
+              attempts     (get-in t [:context ::attempts] 1)
+              max-attempts (get-in t [:context ::max-attempts] (:max-attempts config))]
           (case err-type
             ;; F2: Fatal
             :fatal
@@ -431,7 +431,7 @@
                           (assoc :throttle-expires-at wake-at)
                           (update-in [:tasks task-id] assoc
                                      :status :waiting-retry :wake-at wake-at :error (:error payload))
-                          (update-in [:tasks task-id :context :mf/attempts] inc))})
+                          (update-in [:tasks task-id :context ::attempts] inc))})
 
             ;; F4 & F5: Transient
             :transient
@@ -442,7 +442,7 @@
                  :state (-> state
                             (update-in [:tasks task-id] assoc
                                        :status :waiting-retry :wake-at (+ now backoff) :error (:error payload))
-                            (update-in [:tasks task-id :context :mf/attempts] inc))})
+                            (update-in [:tasks task-id :context ::attempts] inc))})
 
               ;; F5: Exhausted / Parked
               {:directives [[:log {:level :info :event :parked :data task-id}]]
@@ -507,7 +507,7 @@
         (let [non-terminals (->> (:tasks state) vals (remove #(terminal-statuses (:status %))))
               dirs          (mapv (fn [task]
                                     [:abort {:task-id (:task-id task)
-                                             :error   (ex-info "supervisor stopped" {:type :mf/shutdown})}])
+                                             :error   (ex-info "supervisor stopped" {:type ::shutdown})}])
                                   non-terminals)
               state'        (reduce (fn [s task] (assoc-in s [:tasks (:task-id task) :status] :aborted))
                                     state non-terminals)]
@@ -569,7 +569,7 @@
      :classify-error      (fn [error] -> :fatal | :rate-limited | :transient)
      :backoff-fn          (fn [attempts] -> backoff-ms) for transient retries
      :max-attempts        default max attempts when a task's context omits
-                          :mf/max-attempts (default 3)
+                          :dj.concurrency/max-attempts (default 3)
      :default-throttle-ms throttle window for a 429 with no :retry-after (ms)
    See `default-reference-opts`.
 
