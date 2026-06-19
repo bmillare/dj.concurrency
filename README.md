@@ -119,7 +119,7 @@ and a `try/catch` threaded through each of those call sites — and a failure on
 chunk 37 unwinding the stack and discarding the 36 summaries you already paid
 for. *That's* the plumbing the supervisor keeps out of your business logic.
 
-### 2. Transient failures retry automatically
+### 2. Transient failures retry automatically — and *how* is a contract you define
 
 If the closure throws a (non-fatal) error, the supervisor retries it with
 exponential backoff — your `deref` just takes a little longer:
@@ -130,12 +130,54 @@ exponential backoff — your `deref` just takes a little longer:
 ;;=> "<completion>"   ; after 2 automatic retries
 ```
 
-By default the reference policy classifies errors as:
+That "automatic" hides the real design idea, and it's the one to internalize:
+
+> **The closure and the policy communicate through thrown exceptions.** The
+> closure's *only* channel back to the supervisor is what it throws, and the
+> `ex-data` map you attach is the message. The policy reads that map and decides
+> what happens next — retry, throttle, abort, park.
+
+A happy-path closure has two outcomes, and each is a signal. **Returning a value**
+means "done, deliver this." **Throwing** means "I couldn't finish — here's why,"
+where the *why* is structured data, not a string. So writing a closure for a new
+failure mode is really writing the `ex-info` you'll throw to describe it:
+
+```clojure
+(defn call-llm [prompt]
+  (let [resp (http/post endpoint {:body prompt})]
+    (case (:status resp)
+      200 (:body resp)                                  ; return  -> "deliver this"
+      ;; everything below is a *message to the policy*, encoded as ex-data:
+      429 (throw (ex-info "rate limited"
+                          {:status 429                  ; -> throttle the whole supervisor
+                           :retry-after (header-ms resp "retry-after")}))
+      (400 401 403)                                     ; our bug; retrying won't help
+          (throw (ex-info "bad request"
+                          {:type :business-error}))     ; -> abort now, park for inspection
+      ;; 503, socket resets, timeouts, ... : no special data
+      (throw (ex-info (str "transient " (:status resp)) {:status (:status resp)})))))
+```
+
+Nothing in that closure *does* retrying, throttling, or backoff. It only
+**describes** each outcome and throws. The matching half of the contract is the
+policy's `classify-error`, which by default reads the very keys above:
 
 - `:fatal` — `ex-data` has `{:type :business-error}` → abort immediately (no retry),
-- `:rate-limited` — `ex-data` has `{:status 429}` → supervisor-wide throttle,
-- `:transient` — anything else → retry up to `:dj.concurrency/max-attempts` (default 3),
-  then **park**.
+- `:rate-limited` — `ex-data` has `{:status 429}` → supervisor-wide throttle
+  (honoring `:retry-after` from the same `ex-data` as the window length),
+- `:transient` — anything else → retry up to `:dj.concurrency/max-attempts`
+  (default 3), then **park**.
+
+These three classes are just the reference defaults — *a worked example of the
+contract, not the contract itself.* Because the channel is "throw arbitrary data,
+classify it with a pure function," you extend it by agreeing on new keys at both
+ends. Want a `:degraded` signal that falls back to a cheaper model, a
+`:needs-auth-refresh` that re-auths before retrying, or per-tenant concurrency
+caps? Have your closure throw `(ex-info ... {:type :degraded ...})` and supply a
+policy that recognizes it (see [§Customizing policy](#customizing-policy)). The
+closure stays a plain function that throws; *all* signal handling and concurrency
+management lives in the policy. New behavior never means re-plumbing your business
+logic — it means extending the vocabulary the two sides share.
 
 Per-task tuning keys live in the `dj.concurrency` keyword namespace
 (`:dj.concurrency/max-attempts`; with `(require '[dj.concurrency :as dc])` you can
