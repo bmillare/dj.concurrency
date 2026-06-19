@@ -97,7 +97,14 @@ By default the reference policy classifies errors as:
 - `:transient` — anything else → retry up to `:mf/max-attempts` (default 3),
   then **park**.
 
-Tune per-task via the context map, e.g. `{:mf/max-attempts 5}`.
+Tune per-task via the context map, e.g. `{:mf/max-attempts 5}`, or set
+supervisor-wide defaults when you create it:
+
+```clojure
+(c/create-supervisor {:name        "llm"
+                      :max-attempts 5
+                      :backoff-fn  (fn [attempts] (* 250 attempts))}) ; linear, 250ms steps
+```
 
 ### 3. Rate limits throttle the *whole* supervisor
 
@@ -140,9 +147,12 @@ clojure -M:repl -e "(require 'dj.concurrency.llm-demo)(dj.concurrency.llm-demo/-
 
 Lifecycle / submission:
 
-- `create-supervisor` `{:policy ... :name ...}` → supervisor (Component/Integrant-friendly map)
+- `create-supervisor` `{:policy :log-fn :name :backoff-fn :max-attempts ...}` →
+  supervisor (Component/Integrant-friendly map)
 - `submit` `[sup context closure]` → promise stub (`deref` / 3-arg `deref` timeout / `realized?`)
 - `stop!` `[sup]` / `[sup mode]` — `:abort-pending` (default) or `:drop`
+- `wait-for-shutdown` `[sup]` → a promise realized once the shell stops:
+  `(stop! sup)` then `@(wait-for-shutdown sup)`
 
 Inspection (REPL):
 
@@ -152,12 +162,34 @@ Intervention (REPL):
 
 - `deliver-result`, `retry`, `abort`, `cancel`, `clear-throttle`
 
+## Logging (no dependency)
+
+The library never pulls in a logging framework. Every internal event is handed
+to a `:log-fn` you can supply to `create-supervisor`. The default is Clojure's
+built-in **`tap>`** — a no-op unless you register a tap, so nothing is printed
+and nothing conflicts with your app's logging:
+
+```clojure
+(add-tap (fn [entry] (println "[mf]" entry)))    ; opt in to seeing events
+;; or route them yourself:
+(c/create-supervisor {:log-fn (fn [entry] (my-logger/info entry))})
+```
+
+Each entry is a map like `{:level :debug :event :submit-executed :data <task-id>}`.
+
 ## Customizing policy
 
 The supervisor is driven by a **pure** policy function
-`(policy event state) -> [directives state']`. The shell executes the directives
-(spawn worker, resolve/abort a future, log) and keeps `state` pure. Pass your own
-via `:policy` to `create-supervisor`; see `default-policy` in
+`(policy event state) -> {:directives [...] :state new-state}`. Events and
+directives are positional `[type payload]` pairs; everything else is a map. The
+shell executes the directives (spawn worker, resolve/abort a future, log) and
+keeps `state` pure.
+
+Most tuning needs no custom policy — pass `:backoff-fn`, `:max-attempts`,
+`:classify-error`, or `:default-throttle-ms` to `create-supervisor` and they
+thread into `make-reference-policy`. For full control, build a policy explicitly
+with `(make-reference-policy opts)` or supply any `:policy` fn. See
+`default-policy` / `make-reference-policy` in
 [`src/dj/concurrency.clj`](src/dj/concurrency.clj) for the reference state
 machine (submit / success / failed / tick / REPL events / shutdown).
 

@@ -53,10 +53,11 @@
 
 (deftest submit-normal
   (testing "a fresh submit executes immediately and the task is running"
-    (let [[dirs state'] (c/default-policy
-                         [:submit {:task-id "t1" :context {:foo 1}
-                                   :closure (fn [] :ok) :submitted-at 0 :now 1000}]
-                         base-state)]
+    (let [{dirs :directives state' :state}
+          (c/default-policy
+           [:submit {:task-id "t1" :context {:foo 1}
+                     :closure (fn [] :ok) :submitted-at 0 :now 1000}]
+           base-state)]
       (is (contains? (dir-types dirs) :execute))
       (is (= :running (get-in state' [:tasks "t1" :status])))
       (is (= 1 (get-in state' [:tasks "t1" :context :mf/attempts]))
@@ -65,17 +66,17 @@
 (deftest success-resolves
   (testing "success on a running task resolves the future"
     (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
-          [dirs state'] (c/default-policy
-                         [:success {:task-id "t1" :result 42 :now 2000}] state)]
+          {dirs :directives state' :state}
+          (c/default-policy [:success {:task-id "t1" :result 42 :now 2000}] state)]
       (is (= [:resolve {:task-id "t1" :result 42}] (find-dir dirs :resolve)))
       (is (= :resolved (get-in state' [:tasks "t1" :status]))))))
 
 (deftest transient-failure-schedules-retry
   (testing "a transient failure below max-attempts schedules a backed-off retry"
     (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
-          [dirs state'] (c/default-policy
-                         [:failed {:task-id "t1" :error (ex-info "boom" {})
-                                   :now 5000}] state)]
+          {dirs :directives state' :state}
+          (c/default-policy [:failed {:task-id "t1" :error (ex-info "boom" {})
+                                      :now 5000}] state)]
       (is (not (contains? (dir-types dirs) :execute))
           "no immediate re-execute; it waits for the backoff window")
       (is (= :waiting-retry (get-in state' [:tasks "t1" :status])))
@@ -87,37 +88,37 @@
   (testing "a transient failure at max-attempts parks the task for REPL recovery"
     (let [state (assoc-in base-state [:tasks "t1"]
                           (running-task "t1" {:mf/attempts 3 :mf/max-attempts 3}))
-          [_ state'] (c/default-policy
-                      [:failed {:task-id "t1" :error (ex-info "boom" {})
-                                :now 5000}] state)]
+          {state' :state}
+          (c/default-policy [:failed {:task-id "t1" :error (ex-info "boom" {})
+                                      :now 5000}] state)]
       (is (= :parked (get-in state' [:tasks "t1" :status]))))))
 
 (deftest rate-limited-throttles-supervisor
   (testing "a 429 sets a supervisor-wide throttle window"
     (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
-          [_ state'] (c/default-policy
-                      [:failed {:task-id "t1"
-                                :error (ex-info "rl" {:status 429 :retry-after 3000})
-                                :now 1000}] state)]
+          {state' :state}
+          (c/default-policy [:failed {:task-id "t1"
+                                      :error (ex-info "rl" {:status 429 :retry-after 3000})
+                                      :now 1000}] state)]
       (is (= 4000 (:throttle-expires-at state')) "throttle = now + retry-after")
       (is (= :waiting-retry (get-in state' [:tasks "t1" :status]))))))
 
 (deftest fatal-failure-aborts
   (testing "a fatal (business) error aborts immediately, no retry"
     (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
-          [dirs state'] (c/default-policy
-                         [:failed {:task-id "t1"
-                                   :error (ex-info "bad input" {:type :business-error})
-                                   :now 1000}] state)]
+          {dirs :directives state' :state}
+          (c/default-policy [:failed {:task-id "t1"
+                                      :error (ex-info "bad input" {:type :business-error})
+                                      :now 1000}] state)]
       (is (contains? (dir-types dirs) :abort))
       (is (= :aborted (get-in state' [:tasks "t1" :status]))))))
 
 (deftest submit-while-throttled-queues
   (testing "submitting during a throttle window queues instead of executing"
     (let [state (assoc base-state :throttle-expires-at 10000)
-          [dirs state'] (c/default-policy
-                         [:submit {:task-id "t2" :context {} :closure (fn [] :ok)
-                                   :submitted-at 0 :now 5000}] state)]
+          {dirs :directives state' :state}
+          (c/default-policy [:submit {:task-id "t2" :context {} :closure (fn [] :ok)
+                                      :submitted-at 0 :now 5000}] state)]
       (is (not (contains? (dir-types dirs) :execute)))
       (is (= :queued (get-in state' [:tasks "t2" :status]))))))
 
@@ -126,7 +127,8 @@
     (let [state (assoc-in base-state [:tasks "t1"]
                           (assoc (running-task "t1" {:mf/attempts 2})
                                  :status :waiting-retry :wake-at 6000))
-          [dirs state'] (c/default-policy [:tick {:now 6000}] state)]
+          {dirs :directives state' :state}
+          (c/default-policy [:tick {:now 6000}] state)]
       (is (contains? (dir-types dirs) :execute))
       (is (= :running (get-in state' [:tasks "t1" :status])))
       (is (nil? (get-in state' [:tasks "t1" :wake-at]))))))
@@ -137,7 +139,8 @@
                     (assoc :throttle-expires-at 10000)
                     (assoc-in [:tasks "t2"]
                               (assoc (running-task "t2" {}) :status :queued)))
-          [dirs state'] (c/default-policy [:repl/clear-throttle {:now 5000}] state)]
+          {dirs :directives state' :state}
+          (c/default-policy [:repl/clear-throttle {:now 5000}] state)]
       (is (nil? (:throttle-expires-at state')))
       (is (contains? (dir-types dirs) :execute))
       (is (= :running (get-in state' [:tasks "t2" :status]))))))
@@ -146,23 +149,42 @@
   (let [parked (fn [] (assoc-in base-state [:tasks "t1"]
                                 (assoc (running-task "t1" {}) :status :parked)))]
     (testing "deliver resolves a parked task"
-      (let [[dirs state'] (c/default-policy
-                           [:repl/deliver {:task-id "t1" :result :mock :now 1}] (parked))]
+      (let [{dirs :directives state' :state}
+            (c/default-policy [:repl/deliver {:task-id "t1" :result :mock :now 1}] (parked))]
         (is (= [:resolve {:task-id "t1" :result :mock}] (find-dir dirs :resolve)))
         (is (= :resolved (get-in state' [:tasks "t1" :status])))))
     (testing "abort fails a parked task"
-      (let [[dirs state'] (c/default-policy
-                           [:repl/abort {:task-id "t1" :error (ex-info "no" {}) :now 1}]
-                           (parked))]
+      (let [{dirs :directives state' :state}
+            (c/default-policy [:repl/abort {:task-id "t1" :error (ex-info "no" {}) :now 1}]
+                              (parked))]
         (is (contains? (dir-types dirs) :abort))
         (is (= :aborted (get-in state' [:tasks "t1" :status])))))
     (testing "retry re-executes a parked task"
-      (let [[dirs state'] (c/default-policy [:repl/retry {:task-id "t1" :now 1}] (parked))]
+      (let [{dirs :directives state' :state}
+            (c/default-policy [:repl/retry {:task-id "t1" :now 1}] (parked))]
         (is (contains? (dir-types dirs) :execute))
         (is (= :running (get-in state' [:tasks "t1" :status])))))
     (testing "cancel discards a parked task"
-      (let [[_ state'] (c/default-policy [:repl/cancel {:task-id "t1" :now 1}] (parked))]
+      (let [{state' :state}
+            (c/default-policy [:repl/cancel {:task-id "t1" :now 1}] (parked))]
         (is (= :cancelled (get-in state' [:tasks "t1" :status])))))))
+
+(deftest configurable-backoff
+  (testing "make-reference-policy threads a custom :backoff-fn into retries"
+    (let [policy (c/make-reference-policy {:backoff-fn (fn [_] 50)})
+          state  (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
+          {state' :state}
+          (policy [:failed {:task-id "t1" :error (ex-info "boom" {}) :now 1000}] state)]
+      (is (= 1050 (get-in state' [:tasks "t1" :wake-at])) "now + custom 50ms backoff"))))
+
+(deftest configurable-max-attempts
+  (testing "make-reference-policy threads a custom :max-attempts default"
+    (let [policy (c/make-reference-policy {:max-attempts 1})
+          state  (assoc-in base-state [:tasks "t1"] (running-task "t1" {:mf/attempts 1}))
+          {state' :state}
+          (policy [:failed {:task-id "t1" :error (ex-info "boom" {}) :now 1000}] state)]
+      (is (= :parked (get-in state' [:tasks "t1" :status]))
+          "attempts 1 >= max 1 -> parks immediately"))))
 
 ;; =============================================================================
 ;; Integration tests (live supervisor, real virtual threads)
@@ -234,3 +256,21 @@
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"supervisor stopped"
                                 (deref f 2000 :timed-out))))
         (finally (c/stop! sup))))))
+
+(deftest pluggable-log-fn
+  (testing "a custom :log-fn receives log entries (no logging dependency)"
+    (let [entries (atom [])
+          sup     (c/create-supervisor {:log-fn (fn [e] (swap! entries conj e))})]
+      (try
+        @(c/submit sup {} (fn [] :ok))
+        (is (wait-for #(some (fn [e] (= :submit-executed (:event e))) @entries))
+            "the :submit-executed entry was delivered to our log-fn")
+        (finally (c/stop! sup))))))
+
+(deftest wait-for-shutdown-blocks-until-stopped
+  (testing "wait-for-shutdown returns a promise realized once the shell stops"
+    (let [sup (c/create-supervisor {})]
+      (is (not (realized? (c/wait-for-shutdown sup))) "not realized while running")
+      (c/stop! sup)
+      (is (= true (deref (c/wait-for-shutdown sup) 2000 :timed-out))
+          "realized true after shutdown completes"))))
