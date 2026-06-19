@@ -11,4 +11,13 @@
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
-         :exec-fn cognitect.test-runner.api/test}}}
+         :exec-fn cognitect.test-runner.api/test}
+
+  ;; Build + publish (dev-only deps). Build a jar:
+  ;;   clojure -T:build jar
+  ;; Deploy to Clojars (needs CLOJARS_USERNAME + CLOJARS_PASSWORD env vars,
+  ;; where the password is a Clojars deploy token):
+  ;;   clojure -T:build deploy
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}
+                 slipset/deps-deploy {:mvn/version "0.2.2"}}
+          :ns-default build}}}
