@@ -1,0 +1,5 @@
+{:paths ["src"]
+ :deps {}
+ :aliases
+ ;; REPL/dev: pull in dev/ and test/ when they exist.
+ {:repl {:extra-paths ["dev" "test"]}}}
