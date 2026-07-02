@@ -191,6 +191,15 @@ clojure -M:repl -e "(require 'dj.concurrency.llm-demo)(dj.concurrency.llm-demo/-
 ```
 *(Source: [`dev/dj/concurrency/llm_demo.clj`](dev/dj/concurrency/llm_demo.clj))*
 
+### 5. Cleaning up
+
+Task state is retained after a task finishes so your REPL recovery story keeps working—you can always inspect a resolved or aborted task's context and error. When you're done and want to reclaim memory, just prune them:
+
+```clojure
+(c/prune sup)              ; drop all resolved, aborted, or cancelled tasks
+(c/prune sup #{:resolved}) ; or restrict to a subset of statuses
+```
+
 ## API Quick Reference
 
 **Setup & Execution:**
@@ -203,7 +212,7 @@ clojure -M:repl -e "(require 'dj.concurrency.llm-demo)(dj.concurrency.llm-demo/-
 - `state`, `tasks`, `task`, `parked-tasks`
 
 **Intervention (REPL):**
-- `deliver-result`, `retry`, `abort`, `cancel`, `clear-throttle`
+- `deliver-result`, `retry`, `abort`, `cancel`, `clear-throttle`, `prune`
 
 ## Logging
 

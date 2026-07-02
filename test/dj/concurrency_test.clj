@@ -7,7 +7,10 @@
    - Integration tests exercise a live supervisor (real virtual threads) for the
      happy path and the REPL-driven recovery workflow."
   (:require [clojure.test :refer [deftest testing is]]
-            [dj.concurrency :as c]))
+            [clojure.datafy :as datafy]
+            [clojure.string :as str]
+            [dj.concurrency :as c])
+  (:import [java.util.concurrent LinkedBlockingQueue CompletableFuture ExecutionException]))
 
 ;; =============================================================================
 ;; Helpers
@@ -186,6 +189,113 @@
       (is (= :parked (get-in state' [:tasks "t1" :status]))
           "attempts 1 >= max 1 -> parks immediately"))))
 
+;; --- alpha2: correctness fixes + decisions (pure) ---
+
+(deftest interventions-clear-wake-at
+  (testing "deliver/abort/cancel out of :waiting-retry clear :wake-at (1.1b, no busy-loop)"
+    (let [waiting (assoc-in base-state [:tasks "t1"]
+                            (assoc (running-task "t1" {::c/attempts 2})
+                                   :status :waiting-retry :wake-at 6000))]
+      (doseq [[etype payload] [[:repl/deliver {:task-id "t1" :result :x :now 9999}]
+                               [:repl/abort {:task-id "t1" :error (ex-info "no" {}) :now 9999}]
+                               [:repl/cancel {:task-id "t1" :now 9999}]]]
+        (let [{state' :state} (c/default-policy [etype payload] waiting)]
+          (is (nil? (get-in state' [:tasks "t1" :wake-at]))
+              (str etype " clears wake-at")))))))
+
+(deftest deadline-scan-ignores-terminal
+  (testing "a terminal task with a stale :wake-at does not drive the poll timeout (1.1a)"
+    (let [state (assoc-in base-state [:tasks "t1"]
+                          (assoc (running-task "t1" {}) :status :resolved :wake-at 1))]
+      (is (= Long/MAX_VALUE (#'c/ms-until-next-deadline state 10000))))))
+
+(deftest throttled-submit-seeds-attempts
+  (testing "a throttled submit is queued with ::attempts 1; a later transient failure increments cleanly (1.2)"
+    (let [throttled (assoc base-state :throttle-expires-at 10000)
+          {s1 :state} (c/default-policy
+                       [:submit {:task-id "t1" :context {} :closure (fn [] :ok)
+                                 :submitted-at 0 :now 5000}] throttled)]
+      (is (= 1 (get-in s1 [:tasks "t1" :context ::c/attempts]))
+          "queued task seeded with attempts 1")
+      ;; drain: a tick at/after the throttle expiry advances it to :running
+      (let [{s2 :state} (c/default-policy [:tick {:now 10000}] s1)]
+        (is (= :running (get-in s2 [:tasks "t1" :status])))
+        ;; transient failure must not throw and must increment attempts
+        (let [{s3 :state} (c/default-policy
+                           [:failed {:task-id "t1" :error (ex-info "boom" {}) :now 10001}] s2)]
+          (is (= 2 (get-in s3 [:tasks "t1" :context ::c/attempts])))
+          (is (= :waiting-retry (get-in s3 [:tasks "t1" :status]))))))))
+
+(deftest prune-removes-only-terminal
+  (testing "prune drops terminal tasks, keeps non-terminal, emits one log + N drop-cf"
+    (let [mk    (fn [id st] [id (assoc (running-task id {}) :status st)])
+          state (assoc base-state :tasks
+                       (into {} [(mk "r" :resolved) (mk "a" :aborted) (mk "c" :cancelled)
+                                 (mk "p" :parked) (mk "w" :waiting-retry) (mk "run" :running)]))
+          {dirs :directives state' :state}
+          (c/default-policy [:repl/prune {:statuses #{:resolved :aborted :cancelled} :now 1}] state)]
+      (is (= #{"p" "w" "run"} (set (keys (:tasks state')))) "only non-terminal survive")
+      (is (= 3 (count (filter #(= :drop-cf (first %)) dirs))) "one drop-cf per pruned")
+      (is (= 1 (count (filter #(= :log (first %)) dirs))) "one summary log")))
+  (testing "prune with a non-terminal status set prunes nothing"
+    (let [state (assoc-in base-state [:tasks "p"] (assoc (running-task "p" {}) :status :parked))
+          {state' :state}
+          (c/default-policy [:repl/prune {:statuses #{:parked} :now 1}] state)]
+      (is (= #{"p"} (set (keys (:tasks state'))))))))
+
+(deftest decision-1-throttle-keeps-longer-window
+  (testing "a second 429 with a shorter retry-after does not shorten the throttle window"
+    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
+          {s1 :state} (c/default-policy
+                       [:failed {:task-id "t1"
+                                 :error (ex-info "rl" {:status 429 :retry-after 10000})
+                                 :now 1000}] state)
+          s1'  (assoc-in s1 [:tasks "t2"] (running-task "t2" {::c/attempts 1}))
+          {s2 :state} (c/default-policy
+                       [:failed {:task-id "t2"
+                                 :error (ex-info "rl" {:status 429 :retry-after 1000})
+                                 :now 2000}] s1')]
+      (is (= 11000 (:throttle-expires-at s2))
+          "kept the longer expiry (1000+10000), not the shorter (2000+1000)"))))
+
+(deftest decision-2-429-does-not-consume-attempts
+  (testing "a 429 does not count against the retry budget"
+    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
+          {state' :state}
+          (c/default-policy [:failed {:task-id "t1"
+                                      :error (ex-info "rl" {:status 429 :retry-after 1000})
+                                      :now 1000}] state)]
+      (is (= 1 (get-in state' [:tasks "t1" :context ::c/attempts]))
+          "attempts unchanged by a 429"))))
+
+(deftest decision-3-clear-throttle-wakes-429d-task
+  (testing "clear-throttle immediately re-runs the task that received the 429"
+    (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
+          {s1 :state} (c/default-policy
+                       [:failed {:task-id "t1"
+                                 :error (ex-info "rl" {:status 429 :retry-after 60000})
+                                 :now 1000}] state)]
+      (is (true? (get-in s1 [:tasks "t1" :throttle?])) "429'd task tagged :throttle?")
+      (let [{dirs :directives s2 :state}
+            (c/default-policy [:repl/clear-throttle {:now 2000}] s1)]
+        (is (contains? (dir-types dirs) :execute) "waiter re-executed in the same pass")
+        (is (= :running (get-in s2 [:tasks "t1" :status])))
+        (is (nil? (get-in s2 [:tasks "t1" :wake-at])))
+        (is (nil? (get-in s2 [:tasks "t1" :throttle?])) "throttle? cleared on run")))))
+
+(deftest decision-4-retry-resets-attempts
+  (testing "REPL retry grants a fresh budget; the next transient failure retries, not re-parks"
+    (let [state (assoc-in base-state [:tasks "t1"]
+                          (assoc (running-task "t1" {::c/attempts 3 ::c/max-attempts 3})
+                                 :status :parked))
+          {s1 :state} (c/default-policy [:repl/retry {:task-id "t1" :now 1000}] state)]
+      (is (= 1 (get-in s1 [:tasks "t1" :context ::c/attempts])) "attempts reset to 1")
+      (is (= :running (get-in s1 [:tasks "t1" :status])))
+      (let [{s2 :state} (c/default-policy
+                         [:failed {:task-id "t1" :error (ex-info "boom" {}) :now 1001}] s1)]
+        (is (= :waiting-retry (get-in s2 [:tasks "t1" :status]))
+            "retries instead of re-parking")))))
+
 ;; =============================================================================
 ;; Integration tests (live supervisor, real virtual threads)
 ;; =============================================================================
@@ -274,3 +384,66 @@
       (c/stop! sup)
       (is (= true (deref (c/wait-for-shutdown sup) 2000 :timed-out))
           "realized true after shutdown completes"))))
+
+;; --- alpha2: shell/integration ---
+
+(deftest no-busy-loop-after-deliver
+  (testing "delivering a waiting-retry task clears its deadline; the shell stays responsive (1.1)"
+    (let [sup (c/create-supervisor {})]
+      (try
+        (let [f (c/submit sup {} (fn [] (throw (ex-info "flaky" {}))))]
+          (is (wait-for #(= :waiting-retry (status-of f))) "enters waiting-retry after first failure")
+          (c/deliver-result f :mocked)
+          (is (= :mocked (deref f 2000 :timed-out)))
+          ;; past the original backoff window the shell must still process new work promptly
+          (Thread/sleep 1200)
+          (let [g (c/submit sup {} (fn [] :pong))]
+            (is (= :pong (deref g 2000 :timed-out)) "shell still handles new submits")))
+        (finally (c/stop! sup))))))
+
+(deftest throwing-log-fn-survives
+  (testing "a throwing :log-fn never takes down the shell (1.4)"
+    (let [sup (c/create-supervisor {:log-fn (fn [_] (throw (ex-info "boom" {})))})]
+      (is (= 3 (deref (c/submit sup {} (fn [] (+ 1 2))) 2000 :timed-out)))
+      (c/stop! sup)
+      (is (= true (deref (c/wait-for-shutdown sup) 2000 :timed-out))
+          "stop!/wait-for-shutdown still complete"))))
+
+(deftest shutdown-drain-completes-stranded-submit
+  (testing "the shutdown drain completes a stranded :submit's CF exceptionally (1.5)"
+    (let [q  (LinkedBlockingQueue.)
+          cf (CompletableFuture.)]
+      (.put q [:submit {:task-id "t1" :cf cf}])
+      (#'c/drain-stranded-submits! q)
+      (is (.isCompletedExceptionally cf))
+      (let [cause (try (.get cf) nil
+                       (catch ExecutionException e (.getCause e)))]
+        (is (= "supervisor stopped" (ex-message cause)))
+        (is (= ::c/shutdown (:type (ex-data cause))))))))
+
+(deftest print-method-is-compact-handle
+  (testing "printing a future is a compact handle, not the supervisor guts (3.1)"
+    (let [sup (c/create-supervisor {})]
+      (try
+        (let [f (c/submit sup {:prompt "x"} (fn [] (Thread/sleep 10000) :never))
+              s (pr-str f)]
+          (is (str/starts-with? s "#<"))
+          (is (str/includes? s (str (:task-id f))))
+          (is (not (str/includes? s ":tasks")))
+          (is (not (str/includes? s "closure"))))
+        (finally (c/stop! sup))))))
+
+(deftest datafy-exposes-task-and-supervisor
+  (testing "datafy of a stub yields the task map; nav :supervisor drills to state; datafy of sup is state (3.2/3.3)"
+    (let [sup (c/create-supervisor {})]
+      (try
+        (let [f (c/submit sup {} (fn [] (Thread/sleep 10000) :never))]
+          (is (wait-for #(some? (c/task f))) "task registered")
+          (let [d (datafy/datafy f)]
+            (is (= (:task-id f) (:task-id d)))
+            (is (contains? d :status))
+            (is (contains? d :realized?))
+            (is (= (c/state sup) (datafy/nav d :supervisor (:supervisor d)))
+                "nav :supervisor returns the full supervisor state")
+            (is (= (c/state sup) (datafy/datafy sup)) "datafy of the supervisor is its state map")))
+        (finally (c/stop! sup))))))
