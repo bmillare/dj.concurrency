@@ -235,7 +235,9 @@ Under the hood, the supervisor uses a state machine. It is driven by a pure func
 
 Most of the time, you don't need to write a custom policy. You can just pass options like `:backoff-fn`, `:max-attempts`, `:classify-error`, or `:default-throttle-ms` to `create-supervisor`. 
 
-If you *do* need total control over how tasks are managed, you can write your own state transition function and pass it as the `:policy`. Check out `default-policy` and `make-reference-policy` in [`src/dj/concurrency.clj`](src/dj/concurrency.clj) to see how the default state machine handles things like success, failure, REPL interventions, and shutdown.
+If you *do* need total control over how tasks are managed, you can write your own state transition function and pass it as the `:policy`. Check out `default-policy` and `make-reference-policy` (re-exported from `dj.concurrency`, implemented in [`src/dj/concurrency/policy.clj`](src/dj/concurrency/policy.clj)) to see how the default state machine handles things like success, failure, REPL interventions, and shutdown.
+
+> **Internals:** the code is split into a functional core and an imperative shell — [`dj.concurrency.policy`](src/dj/concurrency/policy.clj) is the pure state machine, [`dj.concurrency.shell`](src/dj/concurrency/shell.clj) is the impure runtime (event queue, virtual threads, the future handle), and [`dj.concurrency`](src/dj/concurrency.clj) is the thin user-facing facade. You only ever require `dj.concurrency`.
 
 ## Developing on this repo
 

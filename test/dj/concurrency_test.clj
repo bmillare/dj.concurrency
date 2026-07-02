@@ -9,7 +9,9 @@
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.datafy :as datafy]
             [clojure.string :as str]
-            [dj.concurrency :as c])
+            [dj.concurrency :as c]
+            ;; a couple of private shell internals are poked directly below
+            [dj.concurrency.shell :as shell])
   (:import [java.util.concurrent LinkedBlockingQueue CompletableFuture ExecutionException]))
 
 ;; =============================================================================
@@ -207,7 +209,7 @@
   (testing "a terminal task with a stale :wake-at does not drive the poll timeout (1.1a)"
     (let [state (assoc-in base-state [:tasks "t1"]
                           (assoc (running-task "t1" {}) :status :resolved :wake-at 1))]
-      (is (= Long/MAX_VALUE (#'c/ms-until-next-deadline state 10000))))))
+      (is (= Long/MAX_VALUE (#'shell/ms-until-next-deadline state 10000))))))
 
 (deftest throttled-submit-seeds-attempts
   (testing "a throttled submit is queued with ::attempts 1; a later transient failure increments cleanly (1.2)"
@@ -414,7 +416,7 @@
     (let [q  (LinkedBlockingQueue.)
           cf (CompletableFuture.)]
       (.put q [:submit {:task-id "t1" :cf cf}])
-      (#'c/drain-stranded-submits! q)
+      (#'shell/drain-stranded-submits! q)
       (is (.isCompletedExceptionally cf))
       (let [cause (try (.get cf) nil
                        (catch ExecutionException e (.getCause e)))]
