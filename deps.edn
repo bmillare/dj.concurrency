@@ -7,6 +7,14 @@
  ;; REPL/dev: pull in dev/ and test/ when they exist.
  {:repl {:extra-paths ["dev" "test"]}
 
+  ;; Long-lived nREPL server for REPL-light agent workflow. Start it in the
+  ;; background (writes ./.nrepl-port); eval into it via scripts/cljeval.sh.
+  ;;   clojure -M:nrepl
+  ;; nrepl is a dev-only dep; the library itself stays dependency-free.
+  :nrepl {:extra-deps {nrepl/nrepl {:mvn/version "1.5.1"}}
+          :extra-paths ["dev" "test"]
+          :main-opts ["-m" "nrepl.cmdline"]}
+
   ;; Run the test suite (dev-only deps): clojure -X:test
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
