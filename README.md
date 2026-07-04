@@ -200,19 +200,78 @@ Task state is retained after a task finishes so your REPL recovery story keeps w
 (c/prune sup #{:resolved}) ; or restrict to a subset of statuses
 ```
 
+## Durable results / crash recovery
+
+Long pipelines are expensive to lose. If the JVM dies after summarizing 49 of 50 chunks, you don't want to pay for those 49 LLM calls again on restart. `dj.concurrency` gives you an **opt-in, crash-safe memo table** for task results.
+
+The model is deliberately simple: **deterministic re-run + durable memo table**, *not* process resumption. After a crash you re-run the same workflow from the top; any task whose result was already recorded resolves **instantly from the journal** instead of re-executing. This only requires that your orchestration code derives the *same key* for the same work on re-run.
+
+It's opt-in from two sides, and if either side opts out you get exactly today's behavior:
+
+- The **supervisor** opts in with a `:store` (anything satisfying the 3-fn `dj.concurrency.store/ResultStore` protocol).
+- A **task** opts in by putting `:dj.concurrency/durable-key` in its context.
+
+```clojure
+(require '[dj.concurrency :as c]
+         '[dj.concurrency.store :as store])
+
+;; An in-memory store (great for tests / pure process memoization):
+(def sup (c/create-supervisor {:name "llm" :store (store/atom-store)}))
+
+;; Give each memoizable task a stable key derived from its inputs. A key is just
+;; EDN — derive your own, e.g. [:summarize prompt]:
+(c/submit sup
+          {:prompt p
+           :dj.concurrency/durable-key [:summarize p]}
+          #(call-llm p))
+```
+
+On execution the worker checks the store *before* running your function. A **hit** resolves the future with the cached value (the task is annotated `:cached? true`, visible via `(c/task f)`). A **miss** runs the function, **durably persists the result before the future resolves**, then resolves it — so once `@f` returns, the result is on disk.
+
+Keys are stored **verbatim** — there's no hashing step, so a durable journal stays introspectable (you can read it and see exactly which inputs produced which result). Clojure value-equality decides hits, so map key order is irrelevant. Identical inputs dedupe by design; add a run-id to the key (e.g. `[:summarize run-id p]`) if you want distinct runs to re-execute. If your inputs are large and you don't need the introspection, hash them yourself and use the digest as the key.
+
+### Durable across restarts with dj.recorder
+
+`atom-store` isn't durable. For crash recovery, back the store with a journal such as [`dj.recorder`](https://github.com/bmillare/dj.recorder). The protocol ships here (zero dependencies); the `dj.recorder`-backed adapter lives with `dj.recorder` (namespace `dj.recorder.concurrency-store`) so `dj.concurrency` stays dependency-free:
+
+```clojure
+(require '[dj.recorder :as r]
+         '[dj.recorder.concurrency-store :as cs])
+
+(def db  (r/open "results.edn"))
+(def sup (c/create-supervisor {:name "llm"
+                               :store (cs/recorder-store db [:results "run-42"])}))
+;; run the pipeline; kill the JVM mid-run; restart; re-run the SAME pipeline with
+;; the SAME run-id — completed chunks resolve as :cached? true, hitting no API.
+```
+
+### Notes & guarantees
+
+- **Store failures never fail a task.** Any throw from the store degrades to no-cache (the function runs normally) and is reported through your `:log-fn` as `:store-lookup-failed` / `:store-record-failed`. Persisted-before-resolved is the guarantee on the happy path.
+- **`nil` and `false` are cached.** Results travel in a `{:result r}` envelope, so a cached `nil`/`false` is a genuine hit, not a miss.
+- **Side-effecting tasks just omit the key.** No `:store` or no `:dj.concurrency/durable-key` → identical to today; UI updates and other effects shouldn't be memoized.
+- **Failures write nothing.** A keyed task that throws parks/retries exactly as before; only successful results are recorded.
+- **Stale memo?** `c/retry` on a task whose key already has an entry returns the memo. If the cached value is stale (e.g. the prompt template changed), `(c/evict! sup k)` first, then retry.
+- **REPL mocks are never persisted, intentionally.** `deliver-result` flows through the resolve path, not the worker, so a mock never poisons the durable cache.
+
 ## API Quick Reference
 
 **Setup & Execution:**
-- `create-supervisor` `{:policy :log-fn :name :backoff-fn :max-attempts ...}` → Returns a supervisor map (plays nicely with Component/Integrant).
-- `submit` `[sup context function]` → Returns a future (supports `@`, 3-arg `deref` timeouts, and `realized?`).
+- `create-supervisor` `{:policy :log-fn :name :store :backoff-fn :max-attempts ...}` → Returns a supervisor map (plays nicely with Component/Integrant). Pass `:store` (a `dj.concurrency.store/ResultStore`) to enable durable memoization.
+- `submit` `[sup context function]` → Returns a future (supports `@`, 3-arg `deref` timeouts, and `realized?`). Put `:dj.concurrency/durable-key` in `context` to memoize the result.
 - `stop!` `[sup]` or `[sup mode]` → Stops the supervisor (modes: `:abort-pending` or `:drop`).
 - `wait-for-shutdown` `[sup]` → Returns a promise that resolves when everything is fully stopped.
+
+**Durable memoization (`dj.concurrency.store`):**
+- `ResultStore` protocol — `lookup`, `record!`, `evict!`. Implement it over any journal.
+- `atom-store` → non-durable in-memory store (tests / process memoization).
+- Keys are plain EDN, stored verbatim (no helper needed) — e.g. `[:summarize prompt]`.
 
 **Inspection (REPL):**
 - `state`, `tasks`, `task`, `parked-tasks`
 
 **Intervention (REPL):**
-- `deliver-result`, `retry`, `abort`, `cancel`, `clear-throttle`, `prune`
+- `deliver-result`, `retry`, `abort`, `cancel`, `clear-throttle`, `prune`, `evict!`
 
 ## Logging
 

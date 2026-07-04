@@ -10,9 +10,11 @@
             [clojure.datafy :as datafy]
             [clojure.string :as str]
             [dj.concurrency :as c]
+            [dj.concurrency.store :as store]
             ;; a couple of private shell internals are poked directly below
             [dj.concurrency.shell :as shell])
-  (:import [java.util.concurrent LinkedBlockingQueue CompletableFuture ExecutionException]))
+  (:import [java.util.concurrent LinkedBlockingQueue CompletableFuture ExecutionException
+            CountDownLatch]))
 
 ;; =============================================================================
 ;; Helpers
@@ -449,3 +451,191 @@
                 "nav :supervisor returns the full supervisor state")
             (is (= (c/state sup) (datafy/datafy sup)) "datafy of the supervisor is its state map")))
         (finally (c/stop! sup))))))
+
+;; =============================================================================
+;; Durable result memoization (dj.concurrency.store)
+;; =============================================================================
+
+(defn- spy-store
+  "An atom-backed ResultStore plus the raw atom, so tests can both memoize and
+   inspect what got persisted. Returns {:store ResultStore :data atom}."
+  []
+  (let [a (atom {})]
+    {:store (reify store/ResultStore
+              (lookup  [_ k]       (get @a k))
+              (record! [_ k entry] (swap! a assoc k entry) nil)
+              (evict!  [_ k]       (swap! a dissoc k) nil))
+     :data  a}))
+
+(deftest store-hit-short-circuits-closure
+  (testing "a keyed hit resolves from the memo, never runs the closure, and is tagged :cached?"
+    (let [{:keys [store]} (spy-store)
+          sup (c/create-supervisor {:store store})
+          k   [:sum "prompt-a"]]
+      (try
+        (is (= :computed @(c/submit sup {:dj.concurrency/durable-key k}
+                                    (fn [] :computed))))
+        (let [ran? (atom false)
+              f2   (c/submit sup {:dj.concurrency/durable-key k}
+                             (fn [] (reset! ran? true) (assert false)))]
+          (is (= :computed (deref f2 2000 :timed-out)) "second submit returns the memo")
+          (is (false? @ran?) "the second closure never ran")
+          (is (= :resolved (:status (c/task f2))))
+          (is (true? (:cached? (c/task f2))) "hit is tagged :cached?"))
+        (finally (c/stop! sup))))))
+
+(deftest store-miss-and-absent-config-behave-as-today
+  (testing "miss / no-key / no-store each run the closure with no :cached? annotation"
+    ;; miss: keyed + store, but empty store
+    (let [{:keys [store]} (spy-store)
+          sup (c/create-supervisor {:store store})]
+      (try
+        (let [f (c/submit sup {:dj.concurrency/durable-key [:x 1]}
+                          (fn [] :fresh))]
+          (is (= :fresh (deref f 2000 :timed-out)))
+          (is (not (:cached? (c/task f)))))
+        (finally (c/stop! sup))))
+    ;; store present but task carries no key
+    (let [{:keys [store data]} (spy-store)
+          sup (c/create-supervisor {:store store})]
+      (try
+        (let [f (c/submit sup {} (fn [] :fresh))]
+          (is (= :fresh (deref f 2000 :timed-out)))
+          (is (not (:cached? (c/task f))))
+          (is (empty? @data) "no key => nothing persisted"))
+        (finally (c/stop! sup))))
+    ;; no store at all, task carries a key
+    (let [sup (c/create-supervisor {})]
+      (try
+        (let [f (c/submit sup {:dj.concurrency/durable-key [:x 1]}
+                          (fn [] :fresh))]
+          (is (= :fresh (deref f 2000 :timed-out)))
+          (is (not (:cached? (c/task f)))))
+        (finally (c/stop! sup))))))
+
+(deftest store-caches-nil-and-false-via-envelope
+  (testing "nil and false results are cached (envelope distinguishes a hit from a miss)"
+    (doseq [v [nil false]]
+      (let [{:keys [store]} (spy-store)
+            sup (c/create-supervisor {:store store})
+            k   [:v v]]
+        (try
+          (is (= v (deref (c/submit sup {:dj.concurrency/durable-key k} (fn [] v))
+                          2000 :timed-out)))
+          (let [f2 (c/submit sup {:dj.concurrency/durable-key k}
+                             (fn [] (assert false)))]
+            (is (= v (deref f2 2000 :timed-out)) (str "hit returns cached " (pr-str v)))
+            (is (true? (:cached? (c/task f2)))))
+          (finally (c/stop! sup)))))))
+
+(deftest store-persists-before-future-resolves
+  (testing "the future is not realized until record! returns (persist-then-publish)"
+    (let [latch (CountDownLatch. 1)
+          store (reify store/ResultStore
+                  (lookup  [_ _] nil)
+                  (record! [_ _ _] (.await latch) nil)   ;; block until released
+                  (evict!  [_ _] nil))
+          sup   (c/create-supervisor {:store store})]
+      (try
+        (let [f (c/submit sup {:dj.concurrency/durable-key [:slow 1]}
+                          (fn [] :done))]
+          (is (not (realized? f)) "not realized while record! blocks")
+          (is (= :timed-out (deref f 300 :timed-out)) "still blocked mid-persist")
+          (.countDown latch)
+          (is (= :done (deref f 2000 :timed-out)) "resolves once durable"))
+        (finally (c/stop! sup))))))
+
+(deftest store-failures-degrade-to-no-cache
+  (testing "a throwing lookup or record! never fails the task; both are logged"
+    ;; lookup throws => task runs normally
+    (let [entries (atom [])
+          store   (reify store/ResultStore
+                    (lookup  [_ _] (throw (ex-info "lookup boom" {})))
+                    (record! [_ _ _] nil)
+                    (evict!  [_ _] nil))
+          sup     (c/create-supervisor {:store store :log-fn #(swap! entries conj %)})]
+      (try
+        (is (= :ok (deref (c/submit sup {:dj.concurrency/durable-key [:a 1]}
+                                    (fn [] :ok))
+                          2000 :timed-out)))
+        (is (wait-for #(some (fn [e] (= :store-lookup-failed (:event e))) @entries))
+            "a :store-lookup-failed entry was logged")
+        (finally (c/stop! sup))))
+    ;; record! throws => task still resolves with the computed value
+    (let [entries (atom [])
+          store   (reify store/ResultStore
+                    (lookup  [_ _] nil)
+                    (record! [_ _ _] (throw (ex-info "record boom" {})))
+                    (evict!  [_ _] nil))
+          sup     (c/create-supervisor {:store store :log-fn #(swap! entries conj %)})]
+      (try
+        (is (= :ok (deref (c/submit sup {:dj.concurrency/durable-key [:a 1]}
+                                    (fn [] :ok))
+                          2000 :timed-out)))
+        (is (wait-for #(some (fn [e] (= :store-record-failed (:event e))) @entries))
+            "a :store-record-failed entry was logged")
+        (finally (c/stop! sup))))))
+
+(deftest store-untouched-on-failure-path
+  (testing "a keyed task that throws parks as before and writes nothing to the store"
+    (let [{:keys [store data]} (spy-store)
+          sup (c/create-supervisor {:store store})
+          k   [:fails 1]]
+      (try
+        (let [f (c/submit sup {:dj.concurrency/durable-key k :dj.concurrency/max-attempts 1}
+                          (fn [] (throw (ex-info "down" {}))))]
+          (is (wait-for #(= :parked (status-of f))) "task parks after exhausting retries")
+          (is (empty? @data) "a failed task records nothing"))
+        (finally (c/stop! sup))))))
+
+(deftest evict-forces-re-execution
+  (testing "evict! removes the memo so the next keyed submit re-runs the closure"
+    (let [{:keys [store]} (spy-store)
+          sup (c/create-supervisor {:store store})
+          k   [:e 1]
+          runs (atom 0)]
+      (try
+        (is (= 1 (deref (c/submit sup {:dj.concurrency/durable-key k}
+                                  (fn [] (swap! runs inc)))
+                        2000 :timed-out)))
+        ;; a hit would not re-run; prove eviction re-executes
+        (is (= :evicted (c/evict! sup k)))
+        (is (= 2 (deref (c/submit sup {:dj.concurrency/durable-key k}
+                                  (fn [] (swap! runs inc)))
+                        2000 :timed-out))
+            "closure ran again after eviction")
+        (finally (c/stop! sup))))
+    (testing "evict! on a storeless supervisor is a no-op returning nil"
+      (let [sup (c/create-supervisor {})]
+        (try (is (nil? (c/evict! sup [:whatever])))
+             (finally (c/stop! sup)))))))
+
+(deftest deliver-result-is-never-memoized
+  (testing "a REPL mock flows through resolve, not the worker, so it is not persisted"
+    (let [{:keys [store data]} (spy-store)
+          sup (c/create-supervisor {:store store})
+          k   [:mock 1]
+          ran (atom 0)]
+      (try
+        (let [f (c/submit sup {:dj.concurrency/durable-key k :dj.concurrency/max-attempts 1}
+                          (fn [] (swap! ran inc) (throw (ex-info "down" {}))))]
+          (is (wait-for #(= :parked (status-of f))))
+          (c/deliver-result f :mocked)
+          (is (= :mocked (deref f 2000 :timed-out)))
+          (is (empty? @data) "the mock was not persisted")
+          ;; resubmitting the same key must re-execute (miss), not return the mock
+          (let [g (c/submit sup {:dj.concurrency/durable-key k}
+                            (fn [] (swap! ran inc) :real))]
+            (is (= :real (deref g 2000 :timed-out)) "closure ran; mock was never cached")))
+        (finally (c/stop! sup))))))
+
+(deftest atom-store-roundtrips
+  (testing "atom-store lookup/record!/evict! obey the envelope contract"
+    (let [s (store/atom-store)]
+      (is (nil? (store/lookup s [:k])) "miss is nil")
+      (store/record! s [:k] {:result 42})
+      (is (= {:result 42} (store/lookup s [:k])) "hit returns the envelope")
+      (store/record! s [:nilv] {:result nil})
+      (is (= {:result nil} (store/lookup s [:nilv])) "a nil result is still a hit envelope")
+      (store/evict! s [:k])
+      (is (nil? (store/lookup s [:k])) "evicted key misses"))))

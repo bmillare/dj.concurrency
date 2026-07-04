@@ -91,7 +91,12 @@
         ;; K2: Expected Success
         (= :running status)
         {:directives [[:resolve {:task-id task-id :result (:result payload)}]]
-         :state (assoc-in state [:tasks task-id :status] :resolved)}
+         ;; Enrichment only: carry the store's :cached? provenance onto the task
+         ;; so `(task f)` reports whether a result came from the durable memo.
+         ;; Policies that ignore :cached? lose nothing but the annotation.
+         :state (update-in state [:tasks task-id]
+                           (fn [t] (cond-> (assoc t :status :resolved)
+                                     (:cached? payload) (assoc :cached? true))))}
 
         ;; K3: Illegal
         :else

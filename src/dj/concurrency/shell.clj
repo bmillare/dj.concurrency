@@ -15,6 +15,7 @@
    contract (consumers match on `(:type (ex-data e))`). It is keyed to the
    `dj.concurrency` namespace, so it is written out in full rather than with
    `::` auto-resolution (which would key it to THIS namespace)."
+  (:require [dj.concurrency.store :as store])
   (:import [java.util.concurrent BlockingQueue CompletableFuture
             TimeUnit TimeoutException ExecutionException]
            [clojure.lang IDeref IBlockingDeref IPending]))
@@ -84,17 +85,46 @@
            cf (ex-info "supervisor stopped" {:type :dj.concurrency/shutdown}))))
       (recur))))
 
+(defn- safe-lookup
+  "Store lookup that degrades to a miss on any throw."
+  [sup s k]
+  (try (store/lookup s k)
+       (catch Throwable t
+         (safe-log! sup {:level :warn :event :store-lookup-failed
+                         :data {:key k :error t}})
+         nil)))
+
+(defn- safe-record!
+  "Store persist that degrades to 'not memoized' on any throw.
+   Blocks until durable on success (persist-then-publish)."
+  [sup s k entry]
+  (try (store/record! s k entry)
+       (catch Throwable t
+         (safe-log! sup {:level :warn :event :store-record-failed
+                         :data {:key k :error t}}))))
+
 (defn- execute-worker-wrapper
-  "Code that runs on a VirtualThread (in execute-directive!). Runs the
-  user's closure and routes the result back to the supervisor's single
-  event queue."
-  [{:keys [^BlockingQueue queue]} {:keys [task-id context closure]}]
-  (let [start (System/currentTimeMillis)]
+  "Code that runs on a VirtualThread (in execute-directive!). Consults the
+   supervisor's optional ResultStore for tasks carrying a durable key: a hit
+   short-circuits the closure; a miss runs it and durably records the result
+   BEFORE publishing :success (persist-then-publish). Store failures degrade
+   to no-cache and never fail the task. Routes results back to the
+   supervisor's single event queue."
+  [{:keys [^BlockingQueue queue store] :as sup} {:keys [task-id context closure]}]
+  (let [start (System/currentTimeMillis)
+        k     (:dj.concurrency/durable-key context)]
     (try
-      (let [result (closure)]
+      (if-let [hit (when (and store k) (safe-lookup sup store k))]
         (.put queue [:success {:task-id  task-id
-                               :result   result
-                               :duration (- (System/currentTimeMillis) start)}]))
+                               :result   (:result hit)
+                               :cached?  true
+                               :duration (- (System/currentTimeMillis) start)}])
+        (let [result (closure)]
+          (when (and store k)
+            (safe-record! sup store k {:result result}))
+          (.put queue [:success {:task-id  task-id
+                                 :result   result
+                                 :duration (- (System/currentTimeMillis) start)}])))
       (catch Throwable t
         (.put queue [:failed {:task-id  task-id
                               :context  context

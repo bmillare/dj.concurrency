@@ -15,7 +15,8 @@
   (:require [clojure.core.protocols :as p]
             [clojure.pprint :as pp]
             [dj.concurrency.shell :as shell]
-            [dj.concurrency.policy :as policy])
+            [dj.concurrency.policy :as policy]
+            [dj.concurrency.store :as store])
   (:import [java.util.concurrent LinkedBlockingQueue BlockingQueue CompletableFuture]
            [dj.concurrency.shell ManageableFuture]))
 
@@ -31,6 +32,11 @@
                  Defaults to `(make-reference-policy opts)`.
      :log-fn   - `(fn [entry-map])` invoked for every :log directive. Defaults to
                  `tap>` (dependency-free; silent unless you register a tap).
+     :store    - Optional dj.concurrency.store/ResultStore. When present, tasks
+                 whose context contains :dj.concurrency/durable-key are memoized:
+                 a prior recorded result short-circuits execution and resolves
+                 the future with the cached value (task is annotated :cached?).
+                 Results are persisted durably BEFORE the future resolves.
      :name     - Optional name for logging/identification.
 
    Reference-policy options are also read from `opts` when :policy is not given
@@ -50,6 +56,7 @@
                 :state            state
                 :policy           policy
                 :log-fn           log-fn
+                :store            (:store opts)        ;; optional ResultStore
                 :name             (:name opts)
                 :shutdown-promise (promise)}]
     ;; datafy of the supervisor returns its pure state map (not the raw
@@ -246,6 +253,19 @@
   [sup]
   (.put ^BlockingQueue (:queue sup) [:repl/clear-throttle {}])
   :queued)
+
+(defn evict!
+  "Removes a durable-key's entry from the supervisor's result store, so the
+   next task submitted with that key re-executes instead of pulling the memo.
+   No-op (returns nil) if the supervisor has no store.
+
+   This acts on the store directly (durably); it does not queue an event and
+   does not touch task state or any in-flight task. Use it before `retry` when
+   a cached value has gone stale (e.g. the prompt template changed)."
+  [sup k]
+  (when-let [s (:store sup)]
+    (store/evict! s k)
+    :evicted))
 
 ;; =============================================================================
 ;; Reference policy (re-exports)
