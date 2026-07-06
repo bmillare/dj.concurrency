@@ -288,6 +288,24 @@ By default, it uses Clojure's built-in **`tap>`**. If you don't register a tap l
 ```
 *(Log entries look like: `{:level :debug :event :submit-executed :data <task-id>}`)*
 
+The `:log-fn` is really the supervisor's **event tap** — the one place a running
+supervisor's lifecycle transitions escape to observers. The events most worth
+watching (they make retry/throttle behavior legible, e.g. a retry-storm against a
+saturated backend) are:
+
+| `:event` | `:level` | `:data` | meaning |
+|---|---|---|---|
+| `:submit-executed` | `:debug` | task-id | task handed to a worker thread |
+| `:retry-scheduled` | `:debug` | `{:task-id :attempt :max-attempts :wake-in-ms}` | a transient failure will be retried after a backoff |
+| `:throttle-wait` | `:info` | `{:task-id :wake-in-ms}` | a 429 paused the **whole supervisor** for `:wake-in-ms` |
+| `:parked` | `:info` | task-id | retries exhausted; the task awaits intervention (see `parked-tasks`) |
+
+Following `:retry-scheduled` in the tap is how you *see* — rather than infer from a
+hang — that a slow local/single-worker backend is being retried into deeper
+saturation. The rich, authoritative state for a parked task (its `:context`,
+`:error`, attempt count) lives in `(parked-tasks sup)`; the tap is a low-latency
+doorbell, `parked-tasks` is the source of truth.
+
 ## Customizing policy
 
 Under the hood, the supervisor uses a state machine. It is driven by a pure function that takes the current state and an event, and returns the next state alongside instructions (like "spawn a thread" or "resolve a future").

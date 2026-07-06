@@ -123,7 +123,12 @@
             :rate-limited
             (let [window  (or (:retry-after (ex-data (:error payload))) (:default-throttle-ms config))
                   wake-at (+ now window)]
-              {:directives []
+              ;; Emit a first-class :throttle-wait event: a 429 pauses the WHOLE
+              ;; supervisor, so it is supervisor-level notable (:info), not a
+              ;; routine per-task step. Previously this branch was SILENT, which
+              ;; hid the throttle from the tap (see playground finding F1).
+              {:directives [[:log {:level :info :event :throttle-wait
+                                   :data {:task-id task-id :wake-in-ms window}}]]
                ;; A concurrent, shorter 429 must not shorten a live window, so
                ;; keep the later expiry. A 429 doesn't consume the retry budget
                ;; (being throttled isn't evidence the task is broken). :throttle?
@@ -137,9 +142,17 @@
             ;; F4 & F5: Transient
             :transient
             (if (< attempts max-attempts)
-              ;; F4: Retryable
+              ;; F4: Retryable — schedule a backed-off retry. Emit a first-class
+              ;; :retry-scheduled event (routine per-task step, :debug) so a
+              ;; retry-storm is visible from the tap. Previously SILENT, which is
+              ;; exactly what hid pile-up on a saturated single-worker backend
+              ;; (playground finding F1). :attempt is the NEXT attempt number.
               (let [backoff ((:backoff-fn config) attempts)]
-                {:directives []
+                {:directives [[:log {:level :debug :event :retry-scheduled
+                                     :data {:task-id      task-id
+                                            :attempt      (inc attempts)
+                                            :max-attempts max-attempts
+                                            :wake-in-ms   backoff}}]]
                  :state (-> state
                             (update-in [:tasks task-id] assoc
                                        :status :waiting-retry :wake-at (+ now backoff) :error (:error payload))

@@ -85,37 +85,15 @@
   (emit! "tap" (format "%-16s %-6s %s" event (or (some-> level name) "") (shorten data))))
 
 ;; =============================================================================
-;; 2. verbose-policy — surface the SILENT transitions (Phase-3 candidate)
+;; 2. (GRADUATED) surfacing the silent transitions
 ;; =============================================================================
-;; FINDING (motivates §8 / Phase 3): the reference policy emits NO :log directive
-;; on F4 (transient backoff -> :waiting-retry) or F3 (429 throttle-wait). So the
-;; very sequence we want visible — "timeout -> retried in Ns -> piled onto the
-;; saturated worker -> timeout again -> parked" — is INVISIBLE from the tap as it
-;; stands. You only see :submit-executed and, eventually, :parked. This wrapper
-;; is a non-invasive prototype of what a Phase-3 event-tap should emit.
-
-(defn verbose-policy
-  "Wraps a policy so a transition INTO :waiting-retry emits a tap event
-   (:retry-scheduled for a transient backoff, :throttle-wait for a 429). The
-   reference policy is otherwise silent on these, hiding the retry-storm."
-  [inner]
-  (fn [event state]
-    (let [{:keys [directives] new-state :state :as r} (inner event state)
-          tid    (:task-id (second event))
-          before (get-in state [:tasks tid])
-          after  (get-in new-state [:tasks tid])]
-      (if (and tid after
-               (= :waiting-retry (:status after))
-               (not= :waiting-retry (:status before)))
-        (let [thr?  (:throttle? after)
-              now   (:now (second event))
-              extra [:log {:level :info
-                           :event (if thr? :throttle-wait :retry-scheduled)
-                           :data  {:task-id    tid
-                                   :attempt    (get-in after [:context :dj.concurrency/attempts])
-                                   :wake-in-ms (some-> (:wake-at after) (- now))}}]]
-          (assoc r :directives (conj (vec directives) extra)))
-        r))))
+;; This playground originally wrapped the policy to surface the transitions the
+;; reference policy was SILENT on (F4 transient backoff, F3 429 throttle-wait) —
+;; the invisibility that hid the retry-storm (finding F1). That fix has since been
+;; GRADUATED into the reference policy itself: F4 now emits :retry-scheduled
+;; (:debug, {:data {:task-id :attempt :max-attempts :wake-in-ms}}) and F3 emits
+;; :throttle-wait (:info, {:data {:task-id :wake-in-ms}}). So the scenarios below
+;; use the plain reference policy and the tap tells the whole story on its own.
 
 ;; =============================================================================
 ;; 3. explain-stuck — print-friendly view over parked-tasks (Phase-1 SP1/V-C)
@@ -292,7 +270,7 @@
         sup (c/create-supervisor
              {:name   "naive"
               :log-fn timeline-log-fn
-              :policy (verbose-policy (policy/make-reference-policy {}))})]
+              :policy (policy/make-reference-policy {})})]
     (try
       (let [futs    (submit-batch sup backend n {:max-attempts 2 :client-timeout-ms 500})
             results (await-all futs 6000)]
@@ -321,9 +299,8 @@
         sup (c/create-supervisor
              {:name   "throttle"
               :log-fn timeline-log-fn
-              :policy (verbose-policy
-                       (policy/make-reference-policy
-                        {:classify-error timeout-as-rate :default-throttle-ms 350}))})]
+              :policy (policy/make-reference-policy
+                        {:classify-error timeout-as-rate :default-throttle-ms 350})})]
     (try
       (let [futs    (submit-batch sup backend n {:max-attempts 2 :client-timeout-ms 500})
             results (await-all futs 6000)]
@@ -344,7 +321,7 @@
         sem (Semaphore. permits)
         sup (c/create-supervisor
              {:name "single-flight" :log-fn timeline-log-fn
-              :policy (verbose-policy (policy/make-reference-policy {}))})]
+              :policy (policy/make-reference-policy {})})]
     (try
       (let [promises
             (mapv (fn [i]
@@ -380,7 +357,7 @@
   (let [backend (make-backend {:service-ms 300})
         sup (c/create-supervisor
              {:name "co-sup" :log-fn timeline-log-fn
-              :policy (verbose-policy (policy/make-reference-policy {}))})
+              :policy (policy/make-reference-policy {})})
         stop-cosup (start-co-supervisor sup backend {:max-retries 3})]
     (try
       (let [futs    (submit-batch sup backend n {:max-attempts 1 :client-timeout-ms 500})

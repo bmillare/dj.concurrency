@@ -89,7 +89,12 @@
       (is (= :waiting-retry (get-in state' [:tasks "t1" :status])))
       (is (= 6000 (get-in state' [:tasks "t1" :wake-at]))
           "wake-at = now + 1s backoff for attempt 1")
-      (is (= 2 (get-in state' [:tasks "t1" :context ::c/attempts]))))))
+      (is (= 2 (get-in state' [:tasks "t1" :context ::c/attempts])))
+      ;; F1: the retry is a first-class event so a retry-storm is visible on the tap
+      (let [[_ log] (find-dir dirs :log)]
+        (is (= :retry-scheduled (:event log)) "emits :retry-scheduled")
+        (is (= 2 (get-in log [:data :attempt])) ":attempt is the NEXT attempt number")
+        (is (= 1000 (get-in log [:data :wake-in-ms])) ":wake-in-ms is the backoff")))))
 
 (deftest transient-failure-exhausted-parks
   (testing "a transient failure at max-attempts parks the task for REPL recovery"
@@ -103,12 +108,17 @@
 (deftest rate-limited-throttles-supervisor
   (testing "a 429 sets a supervisor-wide throttle window"
     (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
-          {state' :state}
+          {dirs :directives state' :state}
           (c/default-policy [:failed {:task-id "t1"
                                       :error (ex-info "rl" {:status 429 :retry-after 3000})
                                       :now 1000}] state)]
       (is (= 4000 (:throttle-expires-at state')) "throttle = now + retry-after")
-      (is (= :waiting-retry (get-in state' [:tasks "t1" :status]))))))
+      (is (= :waiting-retry (get-in state' [:tasks "t1" :status])))
+      ;; F1: the throttle is a first-class, supervisor-level event on the tap
+      (let [[_ log] (find-dir dirs :log)]
+        (is (= :throttle-wait (:event log)) "emits :throttle-wait")
+        (is (= :info (:level log)) "supervisor-wide pause is :info, not :debug")
+        (is (= 3000 (get-in log [:data :wake-in-ms])) ":wake-in-ms is the throttle window")))))
 
 (deftest fatal-failure-aborts
   (testing "a fatal (business) error aborts immediately, no retry"
