@@ -38,7 +38,15 @@
   {:classify-error      default-classify-error
    :backoff-fn          default-backoff
    :max-attempts        3
-   :default-throttle-ms 5000})
+   :default-throttle-ms 5000
+   ;; Concurrency admission (RI 16 / approach A2). nil = unbounded (today's exact
+   ;; behavior; every path below is inert). When set to W, the policy bounds
+   ;; concurrent :running tasks to W: a permit == a :running slot, so a task that
+   ;; leaves :running (park, backoff, terminal) frees it, and every worker-bound
+   ;; path (submit, timed retry, repl/co-sup retry) re-acquires through the SINGLE
+   ;; chokepoint below (scan-deadlines). This is the concurrency-axis twin of the
+   ;; time-axis throttle. See ledger/concurrency_limit_approaches_2026_07_06.md.
+   :max-in-flight       nil})
 
 ;; Event transition logic
 (defn- apply-event
@@ -74,12 +82,22 @@
                                :submitted-at (:submitted-at payload)})}
             ;; S3: Normal Submit
             (let [ctx' (assoc (:context payload) :dj.concurrency/attempts 1)]
-              {:directives [[:execute {:task-id task-id :context ctx' :closure (:closure payload)}]
-                            [:log {:level :debug :event :submit-executed :data task-id}]]
-               :state (assoc-in state [:tasks task-id]
-                                {:task-id task-id, :status :running
-                                 :context ctx', :closure (:closure payload)
-                                 :submitted-at (:submitted-at payload)})}))))
+              (if (:max-in-flight config)
+                ;; S3b: Bounded — enter the admission queue (like the throttled S2
+                ;; path, but on the concurrency axis). scan-deadlines admits it
+                ;; the moment a permit is free (often the same pass).
+                {:directives [[:log {:level :debug :event :submit-queued :data task-id}]]
+                 :state (assoc-in state [:tasks task-id]
+                                  {:task-id task-id, :status :queued
+                                   :context ctx', :closure (:closure payload)
+                                   :submitted-at (:submitted-at payload)})}
+                ;; S3a: Unbounded — unchanged direct dispatch.
+                {:directives [[:execute {:task-id task-id :context ctx' :closure (:closure payload)}]
+                              [:log {:level :debug :event :submit-executed :data task-id}]]
+                 :state (assoc-in state [:tasks task-id]
+                                  {:task-id task-id, :status :running
+                                   :context ctx', :closure (:closure payload)
+                                   :submitted-at (:submitted-at payload)})})))))
 
       ;; --- K: Success ---
       :success
@@ -176,10 +194,19 @@
         ;; R1 — a REPL retry grants a fresh attempt budget ("I changed something").
         (#{:parked :waiting-retry :queued} status)
         (let [t' (assoc-in t [:context :dj.concurrency/attempts] 1)]
-          {:directives [[:execute (select-keys t' [:task-id :context :closure])]]
-           :state (update-in state [:tasks task-id] assoc
-                             :status :running :wake-at nil :throttle? nil
-                             :context (:context t'))})
+          (if (:max-in-flight config)
+            ;; R1b: Bounded — a co-sup/REPL retry MUST re-acquire through the same
+            ;; admission chokepoint, or it re-enters uncounted and LEAKS the bound
+            ;; (RC-2/F11, the F10 :on-park leak). So route to :queued; scan admits.
+            {:directives [[:log {:level :debug :event :retry-queued :data task-id}]]
+             :state (update-in state [:tasks task-id] assoc
+                               :status :queued :wake-at nil :throttle? nil
+                               :context (:context t'))}
+            ;; R1a: Unbounded — unchanged direct dispatch.
+            {:directives [[:execute (select-keys t' [:task-id :context :closure])]]
+             :state (update-in state [:tasks task-id] assoc
+                               :status :running :wake-at nil :throttle? nil
+                               :context (:context t'))}))
         ;; R2 & R3
         (= :running status)
         {:directives [[:log {:level :warn :event :already-running :data task-id}]] :state state}
@@ -272,8 +299,16 @@
   "Runs after every event (including ticks). Checks the clock against state
    deadlines and drains tasks accordingly.
    Corresponds to rows T-a, T-b, and T-c in the spec.
-   Takes and returns a {:directives [...] :state {...}} map."
-  [{:keys [directives state]} now]
+   Takes and returns a {:directives [...] :state {...}} map.
+
+   THE ADMISSION CHOKEPOINT (RI 16 / A2): when `config` carries :max-in-flight W,
+   this is the single place a task is admitted to a worker. Every worker-bound
+   path funnels here (submit and repl-retry route to :queued when bounded; timed
+   retries already do), so bounding admissions to the free-permit budget bounds
+   ALL of them from one point — satisfying F11 by construction. A permit == a
+   :running slot; in-flight is just the count of :running tasks, so a park/backoff/
+   terminal transition frees a permit with no bookkeeping."
+  [{:keys [directives state]} config now]
   (let [;; 1. Remove throttle if naturally expired
         throttle-at (:throttle-expires-at state)
         state-1     (if (and throttle-at (<= throttle-at now))
@@ -286,29 +321,61 @@
         ;; 3. Find due tasks (T-a & T-b)
         ;; If we are unthrottled, we drain BOTH queued tasks (T-a / REPL clears)
         ;; AND any retries whose wake-at has arrived (T-b).
-        tasks-to-run (if throttled?
-                       []
-                       (->> (:tasks state-1)
-                            vals
-                            (filter (fn [t]
-                                      (or (= :queued (:status t))
-                                          (and (= :waiting-retry (:status t))
-                                               (:wake-at t)
-                                               (<= (:wake-at t) now)))))))
+        eligible (if throttled?
+                   []
+                   (->> (:tasks state-1)
+                        vals
+                        (filter (fn [t]
+                                  (or (= :queued (:status t))
+                                      (and (= :waiting-retry (:status t))
+                                           (:wake-at t)
+                                           (<= (:wake-at t) now)))))))
 
-        ;; 4. Generate execute directives
-        new-dirs (map (fn [t] [:execute (select-keys t [:task-id :context :closure])])
-                      tasks-to-run)
+        ;; 3b. Concurrency admission (A2): cap the drain to the free-permit budget.
+        ;; Unbounded (W nil) → admit everyone (unchanged). Bounded → admit oldest
+        ;; first (roughly FIFO) up to (W - in-flight); the rest wait for a permit.
+        W          (:max-in-flight config)
+        in-flight  (when W (->> (:tasks state-1) vals
+                                (filter #(= :running (:status %))) count))
+        budget     (when W (max 0 (- W in-flight)))
+        eligible*  (if W (sort-by :submitted-at eligible) eligible)
+        tasks-to-run (if W (take budget eligible*) eligible*)
+        blocked      (if W (drop budget eligible*) [])
 
-        ;; 5. Advance states to :running (clear :throttle?)
-        state-2  (reduce (fn [s t]
-                           (update-in s [:tasks (:task-id t)]
-                                      assoc :status :running :wake-at nil :throttle? nil))
-                         state-1
-                         tasks-to-run)]
+        ;; 4. Generate execute directives (+ admission observability under a bound)
+        exec-dirs (map (fn [t] [:execute (select-keys t [:task-id :context :closure])])
+                       tasks-to-run)
+        grant-logs (when W
+                     (map-indexed
+                      (fn [i t] [:log {:level :debug :event :admission-granted
+                                       :data {:task-id       (:task-id t)
+                                              :in-flight      (+ in-flight i 1)
+                                              :max-in-flight  W}}])
+                      tasks-to-run))
+        ;; :admission-wait fires ONCE per task (only when newly blocked), the twin
+        ;; of :throttle-wait — so a saturated bound is legible without per-event spam.
+        wait-logs (when W
+                    (for [t blocked
+                          :when (not (:admission-waiting? t))]
+                      [:log {:level :info :event :admission-wait
+                             :data {:task-id       (:task-id t)
+                                    :in-flight     in-flight
+                                    :max-in-flight W}}]))
+
+        ;; 5. Advance admitted tasks to :running (clear :throttle?/:admission-waiting?);
+        ;; tag newly-blocked tasks so the wait event doesn't re-fire next pass.
+        state-2  (as-> state-1 s
+                   (reduce (fn [s t]
+                             (update-in s [:tasks (:task-id t)]
+                                        assoc :status :running :wake-at nil
+                                        :throttle? nil :admission-waiting? nil))
+                           s tasks-to-run)
+                   (reduce (fn [s t]
+                             (assoc-in s [:tasks (:task-id t) :admission-waiting?] true))
+                           s blocked))]
 
     ;; T-c (expiry/TTL logic) is reserved for v2.
-    {:directives (into [] (concat directives new-dirs))
+    {:directives (into [] (concat directives grant-logs wait-logs exec-dirs))
      :state state-2}))
 
 ;; Top-level
@@ -320,6 +387,9 @@
      :max-attempts        default max attempts when a task's context omits
                           :dj.concurrency/max-attempts (default 3)
      :default-throttle-ms throttle window for a 429 with no :retry-after (ms)
+     :max-in-flight       optional concurrency bound W (nil = unbounded, default).
+                          When set, at most W tasks are :running at once; excess
+                          submits/retries queue and are admitted as permits free.
    See `default-reference-opts`.
 
    This is how supervisor-level configuration threads into the (otherwise pure,
@@ -329,13 +399,16 @@
   [opts]
   (let [config (merge default-reference-opts
                       (select-keys opts [:classify-error :backoff-fn
-                                         :max-attempts :default-throttle-ms]))]
+                                         :max-attempts :default-throttle-ms
+                                         :max-in-flight]))]
     (fn reference-policy [event state]
       (let [;; Fallback to current time only for test/REPL ergonomics. During
             ;; real usage the impure shell stamps :now onto every event.
             now (:now (second event) (System/currentTimeMillis))]
         (-> (apply-event config event state now)
-            (scan-deadlines now))))))
+            (scan-deadlines config now))))))
+;; NOTE: `->` threads the apply-event result map in as scan-deadlines' FIRST arg,
+;; so the signature is [result-map config now].
 
 (def default-policy
   "The reference policy built with all defaults; equals `(make-reference-policy {})`."

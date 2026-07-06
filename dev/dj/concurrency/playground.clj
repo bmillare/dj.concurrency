@@ -609,6 +609,65 @@
         results)
       (finally (when stop-cosup (stop-cosup)) (c/stop! sup) (shutdown-backend! backend)))))
 
+;; =============================================================================
+;; 10. Experiment E6 (RI 16): A2 — admission as a POLICY concern (the throttle twin)
+;; =============================================================================
+;; E1–E5 all put the bound OUTSIDE the supervisor (a consumer/submit-side
+;; Semaphore). E6 tests the approaches-doc recommendation: move admission INTO the
+;; reference policy via :max-in-flight, so the permit == a :running slot and every
+;; worker-bound path (submit, timed retry, co-sup retry) re-acquires through the
+;; ONE policy chokepoint. Consumers here just `submit` + `deref` — NO gate at all.
+;;
+;; The two falsifiable claims from ledger/concurrency_limit_approaches_2026_07_06.md:
+;;   §4.1  the F10 wedge-vs-leak tradeoff DISSOLVES: a park FREES its permit (no
+;;         wedge) and a co-sup retry RE-ACQUIRES through the gate (no leak) => peak
+;;         in-flight stays = W throughout, all work recovered.
+;;   §4.2  B3 softens: even with NO co-sup, a park no longer wedges the backend —
+;;         the other requests still complete; only the parked one is left unfinished.
+
+(defn scenario-policy-admission
+  "E6) A2 in-policy admission (:max-in-flight = W). No consumer semaphore. Modes:
+     :fail #{} (default)  => pure saturation. Expect F6: 0 retries, 0 parks, peak=W,
+                             all ok — the bound prevents pile-up from INSIDE the policy.
+     :fail #{..} :co-sup? true  => genuine failures park; §4.1 predicts NO wedge, NO
+                             leak: peak stays = W and the co-sup drives parks terminal.
+     :fail #{..} :co-sup? false => §4.2: park frees its permit (others complete, no
+                             wedge); the parked req is simply left unfinished (TIMED-OUT)."
+  [& {:keys [n permits fail co-sup? max-attempts]
+      :or {n 5 permits 1 fail #{} co-sup? false max-attempts 2}}]
+  (println (format "\n========== E6 — policy admission (:max-in-flight=%d) fail=%s co-sup=%s =========="
+                   permits fail co-sup?))
+  (reset-clock!)
+  (let [backend (make-backend {:service-ms 300 :workers permits})
+        _ (when (seq fail) (reset! (:fail-once backend) (set (map #(str "req-" %) fail))))
+        sup (c/create-supervisor
+             {:name "policy-admission" :log-fn timeline-log-fn
+              :policy (policy/make-reference-policy {:max-in-flight permits})})
+        stop-cosup (when co-sup? (start-co-supervisor sup backend {:max-retries 3}))]
+    (try
+      (let [futs    (submit-batch sup backend n {:max-attempts max-attempts :client-timeout-ms 500})
+            results (await-all futs 8000)]
+        (when-not co-sup?
+          (println "--- parked-tasks after (explain-stuck): ---")
+          (explain-stuck sup))
+        (report (format "E6/p%d-fail%d-cosup%s" permits (count fail) co-sup?) backend results)
+        (println "  outcomes detail:" (pr-str (frequencies results)))
+        results)
+      (finally (when stop-cosup (stop-cosup)) (c/stop! sup) (shutdown-backend! backend)))))
+
+(defn run-experiments-3
+  "RI 16: the A2 spike — admission moved INTO the policy. Read the REPORT + timeline:
+   (1) pure saturation is bounded from inside the policy (0 waste, peak=W, all ok);
+   (2) park + co-sup => NO wedge, NO leak (peak stays W, all recovered) — the §4.1
+       claim that the F10 tradeoff dissolves; (3) park + NO co-sup => no wedge, the
+       parked req just doesn't finish — the §4.2 softening of B3."
+  [& _]
+  (scenario-policy-admission :fail #{})                        ; saturation: F6 from inside
+  (scenario-policy-admission :fail #{1} :co-sup? true :max-attempts 1)  ; §4.1 no wedge/no leak
+  (scenario-policy-admission :fail #{1} :co-sup? false :max-attempts 1) ; §4.2 B3 softened
+  (println "\n========== experiments-3 done — compare REPORT + peak backlog ==========")
+  :done)
+
 (defn run-all
   "Runs A -> B -> C -> D as one narrative. Read the timelines top-to-bottom; the
    REPORT lines quantify wasted worker jobs and peak backlog per lever."
