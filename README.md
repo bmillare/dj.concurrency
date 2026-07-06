@@ -104,6 +104,13 @@ To make a single call, hand the supervisor your function and a context map. You 
 ;;=> "Report: <completion>"
 ```
 
+**The deref contract.** `@f` (bare `deref`) blocks until the task reaches a
+**terminal** state: `:resolved` → the value, `:aborted` → it throws. A task that
+exhausts its retries **parks** (§4), and a parked task never becomes terminal on
+its own — so a bare `@f` on it **blocks forever**. In any code that might see a
+park, use a timeout instead: `(deref f timeout-ms timeout-val)`, or run a
+co-supervisor that services parks.
+
 Combining many of these into a pipeline is where it pays off—see [The payoff](#the-payoff) above.
 
 ### 2. Control retries by throwing data
@@ -277,7 +284,7 @@ Keys are stored **verbatim** — there's no hashing step, so a durable journal s
 
 ### Notes & guarantees
 
-- **Store failures never fail a task.** Any throw from the store degrades to no-cache (the function runs normally) and is reported through your `:log-fn` as `:store-lookup-failed` / `:store-record-failed`. Persisted-before-resolved is the guarantee on the happy path.
+- **Store failures never fail a task.** Any throw from the store degrades to no-cache (the function runs normally) and is reported through your `:event-tap` as `:store-lookup-failed` / `:store-record-failed`. Persisted-before-resolved is the guarantee on the happy path.
 - **`nil` and `false` are cached.** Results travel in a `{:result r}` envelope, so a cached `nil`/`false` is a genuine hit, not a miss.
 - **Side-effecting tasks just omit the key.** No `:store` or no `:dj.concurrency/durable-key` → identical to today; UI updates and other effects shouldn't be memoized.
 - **Failures write nothing.** A keyed task that throws parks/retries exactly as before; only successful results are recorded.
@@ -287,7 +294,7 @@ Keys are stored **verbatim** — there's no hashing step, so a durable journal s
 ## API Quick Reference
 
 **Setup & Execution:**
-- `create-supervisor` `{:policy :log-fn :name :store :backoff-fn :max-attempts ...}` → Returns a supervisor map (plays nicely with Component/Integrant). Pass `:store` (a `dj.concurrency.store/ResultStore`) to enable durable memoization.
+- `create-supervisor` `{:policy :event-tap :name :store :backoff-fn :max-attempts ...}` → Returns a supervisor map (plays nicely with Component/Integrant). Pass `:store` (a `dj.concurrency.store/ResultStore`) to enable durable memoization.
 - `submit` `[sup context function]` → Returns a future (supports `@`, 3-arg `deref` timeouts, and `realized?`). Put `:dj.concurrency/durable-key` in `context` to memoize the result.
 - `stop!` `[sup]` or `[sup mode]` → Stops the supervisor (modes: `:abort-pending` or `:drop`).
 - `wait-for-shutdown` `[sup]` → Returns a promise that resolves when everything is fully stopped.
@@ -305,20 +312,21 @@ Keys are stored **verbatim** — there's no hashing step, so a durable journal s
 
 ## Logging
 
-`dj.concurrency` doesn't force a logging framework on you. Internal events are sent to a `:log-fn` you define when creating the supervisor. 
+`dj.concurrency` doesn't force a logging framework on you. Internal events are sent to an `:event-tap` you define when creating the supervisor.
 
-By default, it uses Clojure's built-in **`tap>`**. If you don't register a tap listener, it does nothing, keeping your console clean.
+By default, it uses **`default-event-tap`**: a loud dev breadcrumb that prints every event to `*err*` the instant it is emitted, so a run never parks in silence. It's a development aid, not a production logging strategy — in production, pass your own `:event-tap`:
 
 ```clojure
-;; See the events in your REPL:
-(add-tap (fn [entry] (println "[mf]" entry)))    
+;; Send events to your app's actual logger:
+(c/create-supervisor {:event-tap (fn [entry] (my-logger/info entry))})
 
-;; Or send them to your app's actual logger:
-(c/create-supervisor {:log-fn (fn [entry] (my-logger/info entry))})
+;; Or restore the old silent-by-default behavior (routes to clojure.core/tap>,
+;; a no-op unless you register a tap listener with (add-tap ...)):
+(c/create-supervisor {:event-tap tap>})
 ```
 *(Log entries look like: `{:level :debug :event :submit-executed :data <task-id>}`)*
 
-The `:log-fn` is really the supervisor's **event tap** — the one place a running
+The `:event-tap` is the supervisor's **event tap** — the one place a running
 supervisor's lifecycle transitions escape to observers. The events most worth
 watching (they make retry/throttle behavior legible, e.g. a retry-storm against a
 saturated backend) are:

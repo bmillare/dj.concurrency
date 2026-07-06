@@ -381,14 +381,14 @@
                                 (deref f 2000 :timed-out))))
         (finally (c/stop! sup))))))
 
-(deftest pluggable-log-fn
-  (testing "a custom :log-fn receives log entries (no logging dependency)"
+(deftest pluggable-event-tap
+  (testing "a custom :event-tap receives log entries (no logging dependency)"
     (let [entries (atom [])
-          sup     (c/create-supervisor {:log-fn (fn [e] (swap! entries conj e))})]
+          sup     (c/create-supervisor {:event-tap (fn [e] (swap! entries conj e))})]
       (try
         @(c/submit sup {} (fn [] :ok))
         (is (wait-for #(some (fn [e] (= :submit-executed (:event e))) @entries))
-            "the :submit-executed entry was delivered to our log-fn")
+            "the :submit-executed entry was delivered to our event-tap")
         (finally (c/stop! sup))))))
 
 (deftest wait-for-shutdown-blocks-until-stopped
@@ -415,9 +415,9 @@
             (is (= :pong (deref g 2000 :timed-out)) "shell still handles new submits")))
         (finally (c/stop! sup))))))
 
-(deftest throwing-log-fn-survives
-  (testing "a throwing :log-fn never takes down the shell (1.4)"
-    (let [sup (c/create-supervisor {:log-fn (fn [_] (throw (ex-info "boom" {})))})]
+(deftest throwing-event-tap-survives
+  (testing "a throwing :event-tap never takes down the shell (1.4)"
+    (let [sup (c/create-supervisor {:event-tap (fn [_] (throw (ex-info "boom" {})))})]
       (is (= 3 (deref (c/submit sup {} (fn [] (+ 1 2))) 2000 :timed-out)))
       (c/stop! sup)
       (is (= true (deref (c/wait-for-shutdown sup) 2000 :timed-out))
@@ -563,7 +563,7 @@
                     (lookup  [_ _] (throw (ex-info "lookup boom" {})))
                     (record! [_ _ _] nil)
                     (evict!  [_ _] nil))
-          sup     (c/create-supervisor {:store store :log-fn #(swap! entries conj %)})]
+          sup     (c/create-supervisor {:store store :event-tap #(swap! entries conj %)})]
       (try
         (is (= :ok (deref (c/submit sup {:dj.concurrency/durable-key [:a 1]}
                                     (fn [] :ok))
@@ -577,7 +577,7 @@
                     (lookup  [_ _] nil)
                     (record! [_ _ _] (throw (ex-info "record boom" {})))
                     (evict!  [_ _] nil))
-          sup     (c/create-supervisor {:store store :log-fn #(swap! entries conj %)})]
+          sup     (c/create-supervisor {:store store :event-tap #(swap! entries conj %)})]
       (try
         (is (= :ok (deref (c/submit sup {:dj.concurrency/durable-key [:a 1]}
                                     (fn [] :ok))

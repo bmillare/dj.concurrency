@@ -38,7 +38,7 @@
 ;; 0. A live, human-readable timeline (the "loud tap" default subscriber, V-A)
 ;; =============================================================================
 ;; One lock-guarded println channel that INTERLEAVES three sources into a single
-;; wall-clock timeline: the supervisor's tap (:log-fn), the backend load meter,
+;; wall-clock timeline: the supervisor's tap (:event-tap), the backend load meter,
 ;; and the co-supervisor. Reading top-to-bottom tells the whole story.
 
 (def ^:private t0 (atom 0))
@@ -77,10 +77,11 @@
 ;; =============================================================================
 
 (defn timeline-log-fn
-  "A :log-fn that renders the supervisor's event tap live. This is the 'make the
-   silent default loud' relief: today :log-fn defaults to `tap>`, which is a no-op
-   unless something is registered — so a run parks in total silence. Here every
-   lifecycle event is printed the instant it is emitted."
+  "An `:event-tap` that renders the supervisor's event tap live, teed into the
+   shared `timeline` so a run reads as one interleaved story. The library now
+   ships a loud default (`c/default-event-tap` → *err*); this richer subscriber
+   is the playground's own variant that also interleaves the backend meter and
+   co-supervisor. Every lifecycle event is printed the instant it is emitted."
   [{:keys [level event data]}]
   (emit! "tap" (format "%-16s %-6s %s" event (or (some-> level name) "") (shorten data))))
 
@@ -320,7 +321,7 @@
   (let [backend (make-backend {:service-ms 300})
         sup (c/create-supervisor
              {:name   "naive"
-              :log-fn timeline-log-fn
+              :event-tap timeline-log-fn
               :policy (policy/make-reference-policy {})})]
     (try
       (let [futs    (submit-batch sup backend n {:max-attempts 2 :client-timeout-ms 500})
@@ -349,7 +350,7 @@
         timeout-as-rate (fn [e] (if (= :timeout (:type (ex-data e))) :rate-limited :transient))
         sup (c/create-supervisor
              {:name   "throttle"
-              :log-fn timeline-log-fn
+              :event-tap timeline-log-fn
               :policy (policy/make-reference-policy
                         {:classify-error timeout-as-rate :default-throttle-ms 350})})]
     (try
@@ -371,7 +372,7 @@
   (let [backend (make-backend {:service-ms 300})
         sem (Semaphore. permits)
         sup (c/create-supervisor
-             {:name "single-flight" :log-fn timeline-log-fn
+             {:name "single-flight" :event-tap timeline-log-fn
               :policy (policy/make-reference-policy {})})]
     (try
       (let [promises
@@ -407,7 +408,7 @@
   (reset-clock!)
   (let [backend (make-backend {:service-ms 300})
         sup (c/create-supervisor
-             {:name "co-sup" :log-fn timeline-log-fn
+             {:name "co-sup" :event-tap timeline-log-fn
               :policy (policy/make-reference-policy {})})
         stop-cosup (start-co-supervisor sup backend {:max-retries 3})]
     (try
@@ -437,7 +438,7 @@
   (reset-clock!)
   (let [backend (make-backend {:service-ms 300 :workers workers})
         sem (Semaphore. permits)
-        sup (c/create-supervisor {:name "multi-worker" :log-fn timeline-log-fn
+        sup (c/create-supervisor {:name "multi-worker" :event-tap timeline-log-fn
                                   :policy (policy/make-reference-policy {})})]
     (try
       (let [results (gated-run sup backend sem n {:client-timeout-ms 500})]
@@ -464,7 +465,7 @@
         shared  (Semaphore. 1)
         sem-a   (if (= mode :shared) shared (Semaphore. 1))
         sem-b   (if (= mode :shared) shared (Semaphore. 1))
-        sup (c/create-supervisor {:name "gate-scope" :log-fn timeline-log-fn
+        sup (c/create-supervisor {:name "gate-scope" :event-tap timeline-log-fn
                                   :policy (policy/make-reference-policy {})})]
     (try
       (let [pa (future (gated-run sup backend sem-a half
@@ -490,7 +491,7 @@
   (let [backend (make-backend {:service-ms 300 :workers workers})
         _       (reset! (:fail-once backend) (set (map #(str "req-" %) fail)))
         sem (Semaphore. permits)
-        sup (c/create-supervisor {:name "bound+cosup" :log-fn timeline-log-fn
+        sup (c/create-supervisor {:name "bound+cosup" :event-tap timeline-log-fn
                                   :policy (policy/make-reference-policy {})})
         stop-cosup (start-co-supervisor sup backend {:max-retries 3})]
     (try
@@ -522,7 +523,7 @@
   (let [backend (make-backend {:service-ms 300 :workers 1})
         _ (reset! (:rate-limit-once backend) (set (map #(str "req-" %) rate-limit)))
         sem (Semaphore. 1)
-        sup (c/create-supervisor {:name "throttle-bound" :log-fn timeline-log-fn
+        sup (c/create-supervisor {:name "throttle-bound" :event-tap timeline-log-fn
                                   :policy (policy/make-reference-policy {})})]
     (try
       (let [results (if gated?
@@ -587,7 +588,7 @@
   (let [backend (make-backend {:service-ms 300 :workers 1})
         _ (reset! (:fail-once backend) (set (map #(str "req-" %) fail)))
         sem (Semaphore. permits)
-        sup (c/create-supervisor {:name "submit-gate" :log-fn timeline-log-fn
+        sup (c/create-supervisor {:name "submit-gate" :event-tap timeline-log-fn
                                   :policy (policy/make-reference-policy {})})
         stop-cosup (when co-sup? (start-co-supervisor sup backend {:max-retries 3}))]
     (try
@@ -641,7 +642,7 @@
   (let [backend (make-backend {:service-ms 300 :workers permits})
         _ (when (seq fail) (reset! (:fail-once backend) (set (map #(str "req-" %) fail))))
         sup (c/create-supervisor
-             {:name "policy-admission" :log-fn timeline-log-fn
+             {:name "policy-admission" :event-tap timeline-log-fn
               :policy (policy/make-reference-policy {:max-in-flight permits})})
         stop-cosup (when co-sup? (start-co-supervisor sup backend {:max-retries 3}))]
     (try

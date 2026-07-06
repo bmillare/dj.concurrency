@@ -66,10 +66,10 @@
       Long/MAX_VALUE)))
 
 (defn- safe-log!
-  "Invokes the supervisor's :log-fn, swallowing anything it throws.
-   A broken logger must never take down the shell loop."
+  "Invokes the supervisor's :event-tap, swallowing anything it throws.
+   A broken tap must never take down the shell loop."
   [sup entry]
-  (try ((:log-fn sup) entry)
+  (try ((:event-tap sup) entry)
        (catch Throwable _ nil)))
 
 (defn- drain-stranded-submits!
@@ -165,9 +165,10 @@
     :log
     (do
       ;; Pluggable, dependency-free logging: hand the raw entry map to the
-      ;; supervisor's :log-fn. Default is `tap>` (clojure.core) which is a no-op
-      ;; unless the user registers a tap, so we never depend on or fight with a
-      ;; logging system. Override via {:log-fn ...} on create-supervisor.
+      ;; supervisor's :event-tap. Default is `default-event-tap` (a loud dev
+      ;; breadcrumb to *err*), so we never depend on or fight with a logging
+      ;; system. Override via {:event-tap ...} on create-supervisor (pass `tap>`
+      ;; for the old silent default).
       (safe-log! sup payload)
       cf-registry)))
 
@@ -175,7 +176,7 @@
 (defn run-shell!
   "Starts the supervisor's single-threaded event loop on a Virtual Thread.
    `sup` must contain: {:queue BlockingQueue, :state Atom, :policy IFn,
-   :log-fn IFn, :shutdown-promise promise}.
+   :event-tap IFn, :shutdown-promise promise}.
 
    The policy is called as `(policy event state)` and must return a map
    `{:directives [...] :state new-state}`."

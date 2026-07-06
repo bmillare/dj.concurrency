@@ -24,14 +24,38 @@
 ;; User API
 ;; =============================================================================
 
+(defn default-event-tap
+  "The default `:event-tap`: a loud development breadcrumb.
+
+   Prints every supervisor event to `*err*` as a compact one-liner the instant
+   it is emitted, so a run never parks in total silence. (The pre-rename default
+   was `tap>`, which is invisible unless you register a tap — a run could pile up
+   retries or park with nothing printed.)
+
+   This is deliberately unfiltered and human-oriented — a dev aid, not a
+   production logging strategy. In production, pass your own `:event-tap` to
+   route entries into your logger/telemetry, `tap>` for the old silent behavior,
+   or a level filter of your own.
+
+   Entry shape (the raw contract, unchanged): `{:level kw :event kw :data any}`."
+  [{:keys [level event data]}]
+  (binding [*out* *err*]
+    (println (format "dj.concurrency %-6s %-18s %s"
+                     (or (some-> level name) "")
+                     (or (some-> event name) "")
+                     (pr-str data)))))
+
 (defn create-supervisor
   "Creates and starts a new Manageable Futures supervisor.
 
    Options:
      :policy   - A pure policy `(event state) -> {:directives [...] :state s'}`.
                  Defaults to `(make-reference-policy opts)`.
-     :log-fn   - `(fn [entry-map])` invoked for every :log directive. Defaults to
-                 `tap>` (dependency-free; silent unless you register a tap).
+     :event-tap - `(fn [entry-map])` invoked for every :log directive — the one
+                 place a running supervisor's lifecycle transitions escape to
+                 observers. Defaults to `default-event-tap` (a loud dev
+                 breadcrumb to `*err*`). Pass `tap>` for the old silent
+                 default, or your own fn to route into a logger.
      :store    - Optional dj.concurrency.store/ResultStore. When present, tasks
                  whose context contains :dj.concurrency/durable-key are memoized:
                  a prior recorded result short-circuits execution and resolves
@@ -51,11 +75,11 @@
                       :throttle-expires-at nil
                       :shutdown?           false})
         policy (or (:policy opts) (policy/make-reference-policy opts))
-        log-fn (:log-fn opts tap>)
+        event-tap (:event-tap opts default-event-tap)
         sup    {:queue            q
                 :state            state
                 :policy           policy
-                :log-fn           log-fn
+                :event-tap        event-tap
                 :store            (:store opts)        ;; optional ResultStore
                 :name             (:name opts)
                 :shutdown-promise (promise)}]
