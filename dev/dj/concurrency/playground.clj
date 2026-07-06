@@ -130,14 +130,20 @@
 ;; (a flaky endpoint) — models a genuine transient ERROR the concurrency bound
 ;; cannot prevent (it isn't saturation), so the co-supervisor has something real
 ;; to recover in E3. The failure is fast and never reaches a worker.
+;;
+;; `:rate-limit-once` is like `:fail-once` but throws a REAL 429 (with retry-after)
+;; the first time — the reference policy throttles the WHOLE supervisor for the
+;; window (§3). Used by E4 to see whether the concurrency bound fights or composes
+;; with the supervisor-wide throttle.
 
 (defn make-backend
   [{:keys [service-ms workers] :or {service-ms 300 workers 1}}]
-  {:exec       (Executors/newFixedThreadPool (int workers))
-   :workers    workers
-   :service-ms service-ms
-   :fail-once  (atom #{})
-   :meter      (atom {:submitted 0 :completed 0 :outstanding 0 :peak 0})})
+  {:exec            (Executors/newFixedThreadPool (int workers))
+   :workers         workers
+   :service-ms      service-ms
+   :fail-once       (atom #{})
+   :rate-limit-once (atom #{})
+   :meter           (atom {:submitted 0 :completed 0 :outstanding 0 :peak 0})})
 
 (defn backend-load [backend] (:outstanding @(:meter backend)))
 (defn shutdown-backend! [backend] (.shutdownNow ^ExecutorService (:exec backend)))
@@ -149,7 +155,11 @@
    time (then clears itself). The default classifier sees both as :transient."
   [backend prompt {:keys [client-timeout-ms] :or {client-timeout-ms 500}}]
   (fn []
-    (let [{:keys [^ExecutorService exec service-ms meter fail-once]} backend]
+    (let [{:keys [^ExecutorService exec service-ms meter fail-once rate-limit-once]} backend]
+      (when (and rate-limit-once (contains? @rate-limit-once prompt))
+        (swap! rate-limit-once disj prompt)
+        (throw (ex-info (str "429 rate limited: " prompt)
+                        {:status 429 :retry-after 300 :prompt prompt})))
       (when (and fail-once (contains? @fail-once prompt))
         (swap! fail-once disj prompt)
         (throw (ex-info (str "flaky endpoint (fail-once): " prompt)
@@ -489,6 +499,116 @@
         results)
       (finally (stop-cosup) (c/stop! sup) (shutdown-backend! backend)))))
 
+;; =============================================================================
+;; 9. Experiments E4–E5 (RI 14): the two interactions that gate LIBRARY surface
+;; =============================================================================
+;; E4 asks whether a concurrency bound FIGHTS the supervisor-wide throttle or
+;; COMPOSES with it. E5 prototypes a SUBMIT-SIDE gate (library-style, permit
+;; lifecycle owned by the gate not the consumer) to feel out the release contract:
+;; when should a permit be handed back — on terminal state, or as soon as a task
+;; parks? Both are the open questions from RI 13 §5.
+
+(defn scenario-throttle-bound
+  "E4) Does a concurrency bound FIGHT the supervisor-wide throttle, or COMPOSE with
+   it? Backend is slow (1 worker) AND returns a REAL 429 (retry-after 300ms) on a
+   subset of prompts. The 429 throttles the whole supervisor (§3); the gate bounds
+   in-flight. :gated? false => no gate (throttle alone — the concurrency bound that
+   scenario B was missing); :gated? true => gate permits=1. Claim: they compose on
+   ORTHOGONAL axes (time-pacing vs concurrency), so the gate removes the post-lift
+   thundering herd that made throttle-alone livelock in B."
+  [& {:keys [n gated? rate-limit] :or {n 5 gated? true rate-limit #{2}}}]
+  (println (format "\n========== E4 — bound x throttle: gated?=%s rate-limit=%s ==========" gated? rate-limit))
+  (reset-clock!)
+  (let [backend (make-backend {:service-ms 300 :workers 1})
+        _ (reset! (:rate-limit-once backend) (set (map #(str "req-" %) rate-limit)))
+        sem (Semaphore. 1)
+        sup (c/create-supervisor {:name "throttle-bound" :log-fn timeline-log-fn
+                                  :policy (policy/make-reference-policy {})})]
+    (try
+      (let [results (if gated?
+                      (gated-run sup backend sem n {:client-timeout-ms 500 :max-attempts 3})
+                      (await-all (submit-batch sup backend n {:max-attempts 3 :client-timeout-ms 500}) 8000))]
+        (report (format "E4/%s" (if gated? "gated" "nogate")) backend results)
+        results)
+      (finally (c/stop! sup) (shutdown-backend! backend)))))
+
+(defn- submit-gated
+  "SUBMIT-SIDE gate PROTOTYPE (library-style): the permit lifecycle is owned here,
+   not by the consumer. Acquire a permit (bounded wait so a wedged gate is visible
+   instead of an infinite hang), submit, then a watcher releases the permit per the
+   RELEASE CONTRACT:
+     :terminal => release only when the task reaches :resolved/:aborted/:cancelled —
+                  holds the permit across retries AND parks. Simple and keeps the
+                  bound exact, but a park with no co-sup/deref-timeout WEDGES the
+                  permit (the E5 footgun).
+     :on-park  => release as soon as the task parks — frees capacity so parked work
+                  can't wedge the gate, but parked tasks then sit OUTSIDE the bound
+                  (a co-sup retrying them re-enters unbounded in this prototype).
+   Returns the future, or :gate-timeout if no permit came free in time."
+  [sup backend sem prompt {:keys [release client-timeout-ms max-attempts admit-timeout-ms]
+                           :or {release :terminal client-timeout-ms 500 max-attempts 1
+                                admit-timeout-ms 2500}}]
+  (if-not (.tryAcquire ^Semaphore sem (long admit-timeout-ms) TimeUnit/MILLISECONDS)
+    (do (emit! "gate" (str prompt " NOT admitted (gate wedged — permit never freed)"))
+        :gate-timeout)
+    (do
+      (emit! "gate" (str prompt " admitted (permits left " (.availablePermits ^Semaphore sem)
+                         ", release=" (name release) ")"))
+      (let [f (c/submit sup {:prompt prompt :dj.concurrency/max-attempts max-attempts}
+                        (call backend prompt {:client-timeout-ms client-timeout-ms}))
+            released (atom false)
+            release! (fn [why] (when (compare-and-set! released false true)
+                                 (emit! "gate" (str prompt " permit released (" why ")"))
+                                 (.release ^Semaphore sem)))]
+        (Thread/startVirtualThread
+         (fn []
+           (loop []
+             (let [st (:status (c/task f))]
+               (cond
+                 (#{:resolved :aborted :cancelled} st) (release! (name st))
+                 (and (= release :on-park) (= st :parked)) (release! "on-park")
+                 :else (do (Thread/sleep 15) (recur)))))))
+        f))))
+
+(defn scenario-submit-side-gate
+  "E5) SUBMIT-SIDE gate + release contract. One worker, permits=1, a `fail` subset
+   parks (max-attempts 1). Combinations worth running (see run-experiments-2):
+     :terminal + co-sup  => clean baseline (co-sup drives parks terminal -> released).
+     :terminal + NO co-sup => the parked task WEDGES its permit; with permits=1 the
+                              whole gate stalls and later requests are never admitted
+                              (:gate-timeout). The footgun the recipe warns about.
+     :on-park  + NO co-sup => no wedge (others complete), but the parked task stays
+                              parked (nobody recovers it) -> it TIMED-OUT on its own.
+     :on-park  + co-sup   => no wedge AND recovered."
+  [& {:keys [n permits release co-sup? fail] :or {n 5 permits 1 release :terminal co-sup? true fail #{1}}}]
+  (println (format "\n========== E5 — submit-side gate: release=%s co-sup=%s permits=%d fail=%s =========="
+                   (name release) co-sup? permits fail))
+  (reset-clock!)
+  (let [backend (make-backend {:service-ms 300 :workers 1})
+        _ (reset! (:fail-once backend) (set (map #(str "req-" %) fail)))
+        sem (Semaphore. permits)
+        sup (c/create-supervisor {:name "submit-gate" :log-fn timeline-log-fn
+                                  :policy (policy/make-reference-policy {})})
+        stop-cosup (when co-sup? (start-co-supervisor sup backend {:max-retries 3}))]
+    (try
+      (let [ps (mapv (fn [i]
+                       (let [p (promise)]
+                         (Thread/startVirtualThread
+                          (fn []
+                            (let [f (submit-gated sup backend sem (str "req-" i)
+                                                  {:release release :max-attempts 1})]
+                              (deliver p (if (= :gate-timeout f)
+                                           ":WEDGED"
+                                           (try (deref f 4000 :TIMED-OUT)
+                                                (catch Throwable t (str "ABORTED: " (ex-message t)))))))))
+                         p))
+                     (range n))
+            results (mapv deref ps)]
+        (report (format "E5/%s-cosup%s" (name release) co-sup?) backend results)
+        (println "  outcomes detail:" (pr-str (frequencies results)))
+        results)
+      (finally (when stop-cosup (stop-cosup)) (c/stop! sup) (shutdown-backend! backend)))))
+
 (defn run-all
   "Runs A -> B -> C -> D as one narrative. Read the timelines top-to-bottom; the
    REPORT lines quantify wasted worker jobs and peak backlog per lever."
@@ -515,6 +635,23 @@
   (println "\n========== experiments done — compare REPORT lines ==========")
   :done)
 
+(defn run-experiments-2
+  "RI 14: the two interactions that gate LIBRARY surface.
+   E4 (bound x throttle): no-gate control vs gated — the gate supplies the
+   concurrency bound the throttle lacks, so it composes instead of fighting.
+   E5 (submit-side gate release contract): :terminal is simple but a park with no
+   co-sup WEDGES the permit; :on-park avoids the wedge but puts parked work outside
+   the bound. Read the REPORT + outcomes-detail lines."
+  [& _]
+  (scenario-throttle-bound :gated? false)                       ; E4 control
+  (scenario-throttle-bound :gated? true)                        ; E4 gated: composes
+  (scenario-submit-side-gate :release :terminal :co-sup? true)  ; baseline
+  (scenario-submit-side-gate :release :terminal :co-sup? false) ; WEDGE footgun
+  (scenario-submit-side-gate :release :on-park  :co-sup? false) ; no wedge, unrecovered
+  (scenario-submit-side-gate :release :on-park  :co-sup? true)  ; no wedge, recovered
+  (println "\n========== experiments-2 done — compare REPORT + outcomes-detail ==========")
+  :done)
+
 (comment
   (require 'dj.concurrency.playground :reload)
   (dj.concurrency.playground/run-all)
@@ -528,4 +665,10 @@
   (scenario-gate-scope :mode :local)
   (scenario-gate-scope :mode :shared)
   (scenario-bound-plus-cosup :fail #{1 3})
+
+  ;; RI 14 experiments (bound x throttle + submit-side gate release contract):
+  (dj.concurrency.playground/run-experiments-2)
+  (scenario-throttle-bound :gated? true)
+  (scenario-submit-side-gate :release :terminal :co-sup? false)
+  (scenario-submit-side-gate :release :on-park :co-sup? true)
   )
