@@ -200,6 +200,36 @@ Task state is retained after a task finishes so your REPL recovery story keeps w
 (c/prune sup #{:resolved}) ; or restrict to a subset of statuses
 ```
 
+### 6. Bound concurrency to a slow/limited backend (recipe)
+
+Retries and throttling (§2, §3) both *react after* a request has already timed out. But if the real problem is that your backend can only serve a few requests at once — a local LLM with one worker, a small connection pool, a rate-limited-by-concurrency API — the cleaner fix is to **not over-subscribe it in the first place**. Firing 5 requests at a 1-worker backend just makes 4 of them wait past their timeout; retrying then piles *more* work onto the already-saturated worker and makes it worse.
+
+Bounding in-flight work is a **different axis** from retry/backoff, and today it's a short consumer-side recipe — one semaphore sized to the backend's real concurrency:
+
+```clojure
+(import '[java.util.concurrent Semaphore])
+
+;; ONE gate per backend, sized to the backend's real concurrency:
+;;   a single-worker local model => 1 permit;  a pool of N workers => N permits.
+(def gate (Semaphore. 1))
+
+(defn bounded [work-fn]
+  (.acquire gate)                       ; only `permits` requests reach the backend at once
+  (try @(c/submit sup {} work-fn)       ; so nothing times out from pile-up
+       (finally (.release gate))))
+
+;; Fan out however you like — the gate caps in-flight work at the permit count:
+(mapv #(future (bounded %)) work-fns)
+```
+
+Three things make or break this recipe:
+
+- **Size the permits to the backend's worker count.** Too many permits re-creates the pile-up (over-subscription); too few just leaves workers idle. Permits = workers is the sweet spot.
+- **Use *one* gate per backend, shared by every call site.** The bound is a property of the *backend*, not the call site: two independent callers each locally capped at 1 still put 2 requests on a shared 1-worker backend. Only a single shared semaphore actually bounds it.
+- **Don't let a parked task hold its permit forever.** The `bounded` helper holds the permit across the whole `deref` (deliberately — that keeps the bound intact across retries). But a task that exhausts its retries **parks**, and a bare `@` on a parked task blocks forever (see §4), wedging the permit. So pair this recipe with either a `(deref f timeout ...)` or a co-supervisor that services parks (§4) — the concurrency bound (prevention) and park-recovery (cure) compose cleanly.
+
+> This is a documented recipe, not yet library surface. If you find yourself needing one gate shared across many call sites or supervisors, that's the signal it should become a first-class per-backend concurrency limit — tell us about your workload.
+
 ## Durable results / crash recovery
 
 Long pipelines are expensive to lose. If the JVM dies after summarizing 49 of 50 chunks, you don't want to pay for those 49 LLM calls again on restart. `dj.concurrency` gives you an **opt-in, crash-safe memo table** for task results.

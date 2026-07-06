@@ -117,30 +117,43 @@
     (count parked)))
 
 ;; =============================================================================
-;; 4. Simulated slow SINGLE-WORKER backend (deterministic, no infra)
+;; 4. Simulated slow backend (deterministic, no infra); default = ONE worker
 ;; =============================================================================
-;; A single-thread executor IS the one worker: it serializes requests FIFO. The
-;; client call waits only up to `client-timeout-ms`; on timeout it abandons the
-;; wait BUT THE WORKER KEEPS THE JOB (models real pile-up — an abandoned request
-;; still consumes the worker, and a retry adds ANOTHER job behind it). The meter
-;; tracks worker backlog (submitted - completed) so pile-up is measurable.
+;; A fixed thread pool of `:workers` (default 1) IS the backend: it serializes
+;; requests when workers=1, runs up to W concurrently otherwise. The client call
+;; waits only up to `client-timeout-ms`; on timeout it abandons the wait BUT THE
+;; WORKER KEEPS THE JOB (models real pile-up — an abandoned request still consumes
+;; a worker, and a retry adds ANOTHER job behind it). The meter tracks worker
+;; backlog (submitted - completed) so pile-up is measurable.
+;;
+;; `:fail-once` is a set of prompts that FAIL FAST the first time they are called
+;; (a flaky endpoint) — models a genuine transient ERROR the concurrency bound
+;; cannot prevent (it isn't saturation), so the co-supervisor has something real
+;; to recover in E3. The failure is fast and never reaches a worker.
 
 (defn make-backend
-  [{:keys [service-ms] :or {service-ms 300}}]
-  {:exec       (Executors/newSingleThreadExecutor)
+  [{:keys [service-ms workers] :or {service-ms 300 workers 1}}]
+  {:exec       (Executors/newFixedThreadPool (int workers))
+   :workers    workers
    :service-ms service-ms
+   :fail-once  (atom #{})
    :meter      (atom {:submitted 0 :completed 0 :outstanding 0 :peak 0})})
 
 (defn backend-load [backend] (:outstanding @(:meter backend)))
 (defn shutdown-backend! [backend] (.shutdownNow ^ExecutorService (:exec backend)))
 
 (defn call
-  "Returns a 0-arg closure (hand to `c/submit`) that hits the single-worker
-   backend with a client-side timeout. Timeout throws an ex-info tagged
-   {:type :timeout}; the default classifier sees that as :transient."
+  "Returns a 0-arg closure (hand to `c/submit`) that hits the backend with a
+   client-side timeout. Timeout throws an ex-info tagged {:type :timeout}; a
+   prompt in the backend's :fail-once set throws {:type :transient} the first
+   time (then clears itself). The default classifier sees both as :transient."
   [backend prompt {:keys [client-timeout-ms] :or {client-timeout-ms 500}}]
   (fn []
-    (let [{:keys [^ExecutorService exec service-ms meter]} backend]
+    (let [{:keys [^ExecutorService exec service-ms meter fail-once]} backend]
+      (when (and fail-once (contains? @fail-once prompt))
+        (swap! fail-once disj prompt)
+        (throw (ex-info (str "flaky endpoint (fail-once): " prompt)
+                        {:type :transient :prompt prompt})))
       (swap! meter (fn [m]
                      (let [o (inc (:outstanding m))]
                        (assoc m :submitted (inc (:submitted m))
@@ -254,6 +267,34 @@
     (emit! "REPORT" (format "%s: %d logical reqs -> %d worker jobs (%d WASTED by retries), peak backlog=%d"
                             label n (:submitted m) (- (:submitted m) n) (:peak m)))))
 
+(defn- gated-run
+  "Admit each of `n` requests through a shared `sem` (acquire -> submit -> deref ->
+   release), one vthread per request. The semaphore is the CONCURRENCY-LIMIT
+   primitive: a request only reaches the backend once a permit is free, so peak
+   in-flight is bounded by (.availablePermits). Returns the results vector.
+   `first-req` offsets the request numbering so two consumers can share a backend
+   without colliding prompt names (used by E2)."
+  [sup backend sem n {:keys [client-timeout-ms max-attempts first-req label]
+                      :or {client-timeout-ms 500 max-attempts 2 first-req 0 label "gate"}}]
+  (let [ps (mapv (fn [i]
+                   (let [idx (+ first-req i)
+                         p   (promise)]
+                     (Thread/startVirtualThread
+                      (fn []
+                        (.acquire ^Semaphore sem)
+                        (emit! label (str "req-" idx " admitted (permits left "
+                                          (.availablePermits ^Semaphore sem) ")"))
+                        (let [prompt (str "req-" idx)
+                              f (c/submit sup {:prompt prompt
+                                               :dj.concurrency/max-attempts max-attempts}
+                                          (call backend prompt {:client-timeout-ms client-timeout-ms}))]
+                          (deliver p (try (deref f 20000 :TIMED-OUT)
+                                          (catch Throwable t (str "ABORTED: " (ex-message t)))))
+                          (.release ^Semaphore sem))))
+                     p))
+                 (range n))]
+    (mapv deref ps)))
+
 ;; =============================================================================
 ;; 7. Scenarios
 ;; =============================================================================
@@ -366,6 +407,88 @@
         results)
       (finally (stop-cosup) (c/stop! sup) (shutdown-backend! backend)))))
 
+;; =============================================================================
+;; 8. Experiments E1–E3 (RI 13): pin down the SHAPE of the concurrency bound
+;; =============================================================================
+;; Scenario C proved the bound is real, but only for a single-worker backend with
+;; one in-process gate. These probe the three questions that gate the DESIGN
+;; decision (consumer recipe vs. library surface): does it generalize past W=1
+;; (E1); WHERE must the gate live to actually bound the backend (E2); and does it
+;; COMPOSE with the co-supervisor (E3)?
+
+(defn scenario-multi-worker
+  "E1) Does the bound generalize past a single worker? Backend has W workers; we
+   admit `permits` in-flight. Claim: THE KNOB IS WORKER COUNT. permits=W => full
+   utilization, 0 waste, peak backlog=W. permits>W => over-admission re-introduces
+   pile-up (timeouts/retries return). permits<W => underutilized (still 0 waste,
+   just slower). Run it three ways to see the knob."
+  [& {:keys [n workers permits] :or {n 6 workers 2 permits 2}}]
+  (println (format "\n========== E1 — multi-worker: workers=%d permits=%d n=%d ==========" workers permits n))
+  (reset-clock!)
+  (let [backend (make-backend {:service-ms 300 :workers workers})
+        sem (Semaphore. permits)
+        sup (c/create-supervisor {:name "multi-worker" :log-fn timeline-log-fn
+                                  :policy (policy/make-reference-policy {})})]
+    (try
+      (let [results (gated-run sup backend sem n {:client-timeout-ms 500})]
+        (report (format "E1/w%d-p%d" workers permits) backend results)
+        results)
+      (finally (c/stop! sup) (shutdown-backend! backend)))))
+
+(defn scenario-gate-scope
+  "E2) WHERE must the bound live? ONE shared worker (W=1). Two independent consumers
+   each submit half the requests.
+     :local  => each consumer holds its OWN Semaphore(1). Each serializes ITSELF,
+               but aggregate in-flight = 2 on one worker => the worker saturates and
+               pile-up RETURNS. A per-call-site bound does NOT compose.
+     :shared => both consumers share ONE Semaphore(1) => aggregate in-flight bounded
+               => clean, 0 waste.
+   Lesson: the bound is a property of the BACKEND, not the call site. To bound a
+   backend shared by N consumers you need ONE gate they all pass through — the
+   argument for a library/supervisor-level gate over ad-hoc consumer semaphores."
+  [& {:keys [n mode] :or {n 6 mode :local}}]
+  (println (format "\n========== E2 — gate scope: %s (one worker, two consumers, n=%d) ==========" (name mode) n))
+  (reset-clock!)
+  (let [backend (make-backend {:service-ms 300 :workers 1})
+        half    (quot n 2)
+        shared  (Semaphore. 1)
+        sem-a   (if (= mode :shared) shared (Semaphore. 1))
+        sem-b   (if (= mode :shared) shared (Semaphore. 1))
+        sup (c/create-supervisor {:name "gate-scope" :log-fn timeline-log-fn
+                                  :policy (policy/make-reference-policy {})})]
+    (try
+      (let [pa (future (gated-run sup backend sem-a half
+                                  {:client-timeout-ms 500 :first-req 0 :label "consumerA"}))
+            pb (future (gated-run sup backend sem-b (- n half)
+                                  {:client-timeout-ms 500 :first-req half :label "consumerB"}))
+            results (into (deref pa) (deref pb))]
+        (report (format "E2/%s" (name mode)) backend results)
+        results)
+      (finally (c/stop! sup) (shutdown-backend! backend)))))
+
+(defn scenario-bound-plus-cosup
+  "E3) Do PREVENTION (concurrency bound) and RECOVERY (co-supervisor) COMPOSE? A
+   shared gate (permits=W) bounds saturation so nothing times out from pile-up —
+   but a `fail` subset hits a flaky-endpoint ERROR the bound cannot prevent (not
+   saturation); with max-attempts 1 they PARK. A co-supervisor services those parks.
+   Claim: complementary, non-conflicting — the gate makes parks RARE (only genuine
+   failures), and the co-sup mops those up. Peak backlog stays = permits throughout;
+   the co-sup drives the parked requests to completion so every permit is released."
+  [& {:keys [n workers permits fail] :or {n 6 workers 1 permits 1 fail #{1 3}}}]
+  (println (format "\n========== E3 — bound + co-supervisor: workers=%d permits=%d fail=%s ==========" workers permits fail))
+  (reset-clock!)
+  (let [backend (make-backend {:service-ms 300 :workers workers})
+        _       (reset! (:fail-once backend) (set (map #(str "req-" %) fail)))
+        sem (Semaphore. permits)
+        sup (c/create-supervisor {:name "bound+cosup" :log-fn timeline-log-fn
+                                  :policy (policy/make-reference-policy {})})
+        stop-cosup (start-co-supervisor sup backend {:max-retries 3})]
+    (try
+      (let [results (gated-run sup backend sem n {:client-timeout-ms 500 :max-attempts 1})]
+        (report (format "E3/w%d-p%d" workers permits) backend results)
+        results)
+      (finally (stop-cosup) (c/stop! sup) (shutdown-backend! backend)))))
+
 (defn run-all
   "Runs A -> B -> C -> D as one narrative. Read the timelines top-to-bottom; the
    REPORT lines quantify wasted worker jobs and peak backlog per lever."
@@ -377,10 +500,32 @@
   (println "\n========== done — compare REPORT lines: wasted jobs & peak backlog per lever ==========")
   :done)
 
+(defn run-experiments
+  "RI 13: runs E1 (three ways) -> E2 (both scopes) -> E3. Read the REPORT lines:
+   E1 shows permits=W is the sweet spot; E2 shows only the SHARED gate stays clean;
+   E3 shows the gate + co-supervisor compose (bound prevents saturation, co-sup
+   recovers the genuine failures)."
+  [& _]
+  (scenario-multi-worker :workers 2 :permits 2)   ; permits=W: clean
+  (scenario-multi-worker :workers 2 :permits 4)   ; permits>W: over-admission
+  (scenario-multi-worker :workers 2 :permits 1)   ; permits<W: underutilized
+  (scenario-gate-scope :mode :local)              ; per-call-site: saturates
+  (scenario-gate-scope :mode :shared)             ; shared: clean
+  (scenario-bound-plus-cosup)                     ; prevention + recovery
+  (println "\n========== experiments done — compare REPORT lines ==========")
+  :done)
+
 (comment
   (require 'dj.concurrency.playground :reload)
   (dj.concurrency.playground/run-all)
   ;; or drive individual levers:
   (scenario-naive :n 6)
   (scenario-single-flight :n 6 :permits 1)
+
+  ;; RI 13 experiments (shape of the concurrency bound):
+  (dj.concurrency.playground/run-experiments)
+  (scenario-multi-worker :workers 3 :permits 3)
+  (scenario-gate-scope :mode :local)
+  (scenario-gate-scope :mode :shared)
+  (scenario-bound-plus-cosup :fail #{1 3})
   )
