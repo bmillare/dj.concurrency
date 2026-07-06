@@ -104,12 +104,12 @@ To make a single call, hand the supervisor your function and a context map. You 
 ;;=> "Report: <completion>"
 ```
 
-**The deref contract.** `@f` (bare `deref`) blocks until the task reaches a
-**terminal** state: `:resolved` → the value, `:aborted` → it throws. A task that
-exhausts its retries **parks** (§4), and a parked task never becomes terminal on
-its own — so a bare `@f` on it **blocks forever**. In any code that might see a
-park, use a timeout instead: `(deref f timeout-ms timeout-val)`, or run a
-co-supervisor that services parks.
+**The deref contract.** `@f` blocks until the task reaches a **terminal** state
+(`:resolved` returns the value, `:aborted` throws). A task that exhausts its retries
+**parks** (§4) and never becomes terminal on its own, so a bare `@f` on a parked task
+**blocks forever** — use `(deref f timeout-ms timeout-val)` or a co-supervisor in any
+code that might see a park. (Full contract in the
+[in-depth guide](README_AGENTS.md#the-deref-contract-in-full).)
 
 Combining many of these into a pipeline is where it pays off—see [The payoff](#the-payoff) above.
 
@@ -152,7 +152,7 @@ The supervisor's default policy looks at the keys in your `ex-data`:
 - If it sees `{:status 429}`, it **throttles** the entire supervisor (pausing all other requests for the duration of `:retry-after`).
 - If it sees anything else, it assumes a transient error and **retries** up to the max attempt limit (default is 3), and then parks.
 
-You can customize this entirely. If you want to trigger special behavior (like falling back to a cheaper model, or refreshing an auth token), just have your function throw a specific key in `ex-info` and configure the supervisor to look for it (see *Customizing policy* below).
+You can customize this entirely. If you want to trigger special behavior (like falling back to a cheaper model, or refreshing an auth token), just have your function throw a specific key in `ex-info` and configure the supervisor to look for it (see [Customizing policy](README_AGENTS.md#customizing-policy)).
 
 You can tweak the default settings globally when creating the supervisor, or per-task via the context map (using the `:dj.concurrency/` namespace):
 
@@ -207,212 +207,16 @@ Task state is retained after a task finishes so your REPL recovery story keeps w
 (c/prune sup #{:resolved}) ; or restrict to a subset of statuses
 ```
 
-### 6. Bound concurrency to a slow/limited backend (recipe)
+## Going further
 
-Retries and throttling (§2, §3) both *react after* a request has already timed out. But if the real problem is that your backend can only serve a few requests at once — a local LLM with one worker, a small connection pool, a rate-limited-by-concurrency API — the cleaner fix is to **not over-subscribe it in the first place**. Firing 5 requests at a 1-worker backend just makes 4 of them wait past their timeout; retrying then piles *more* work onto the already-saturated worker and makes it worse.
+The [in-depth guide (`README_AGENTS.md`)](README_AGENTS.md) covers the rest — aimed at contributors, power users, and coding agents:
 
-Bounding in-flight work is a **different axis** from retry/backoff, and today it's a short consumer-side recipe — one semaphore sized to the backend's real concurrency:
-
-```clojure
-(import '[java.util.concurrent Semaphore])
-
-;; ONE gate per backend, sized to the backend's real concurrency:
-;;   a single-worker local model => 1 permit;  a pool of N workers => N permits.
-(def gate (Semaphore. 1))
-
-(defn bounded [work-fn]
-  (.acquire gate)                       ; only `permits` requests reach the backend at once
-  (try @(c/submit sup {} work-fn)       ; so nothing times out from pile-up
-       (finally (.release gate))))
-
-;; Fan out however you like — the gate caps in-flight work at the permit count:
-(mapv #(future (bounded %)) work-fns)
-```
-
-Three things make or break this recipe:
-
-- **Size the permits to the backend's worker count.** Too many permits re-creates the pile-up (over-subscription); too few just leaves workers idle. Permits = workers is the sweet spot.
-- **Use *one* gate per backend, shared by every call site.** The bound is a property of the *backend*, not the call site: two independent callers each locally capped at 1 still put 2 requests on a shared 1-worker backend. Only a single shared semaphore actually bounds it.
-- **Don't let a parked task hold its permit forever.** The `bounded` helper holds the permit across the whole `deref` (deliberately — that keeps the bound intact across retries). But a task that exhausts its retries **parks**, and a bare `@` on a parked task blocks forever (see §4), wedging the permit. So pair this recipe with either a `(deref f timeout ...)` or a co-supervisor that services parks (§4) — the concurrency bound (prevention) and park-recovery (cure) compose cleanly.
-
-> This is a documented recipe, not yet library surface. If you find yourself needing one gate shared across many call sites or supervisors, that's the signal it should become a first-class per-backend concurrency limit — tell us about your workload.
-
-## Durable results / crash recovery
-
-Long pipelines are expensive to lose. If the JVM dies after summarizing 49 of 50 chunks, you don't want to pay for those 49 LLM calls again on restart. `dj.concurrency` gives you an **opt-in, crash-safe memo table** for task results.
-
-The model is deliberately simple: **deterministic re-run + durable memo table**, *not* process resumption. After a crash you re-run the same workflow from the top; any task whose result was already recorded resolves **instantly from the journal** instead of re-executing. This only requires that your orchestration code derives the *same key* for the same work on re-run.
-
-It's opt-in from two sides, and if either side opts out you get exactly today's behavior:
-
-- The **supervisor** opts in with a `:store` (anything satisfying the 3-fn `dj.concurrency.store/ResultStore` protocol).
-- A **task** opts in by putting `:dj.concurrency/durable-key` in its context.
-
-```clojure
-(require '[dj.concurrency :as c]
-         '[dj.concurrency.store :as store])
-
-;; An in-memory store (great for tests / pure process memoization):
-(def sup (c/create-supervisor {:name "llm" :store (store/atom-store)}))
-
-;; Give each memoizable task a stable key derived from its inputs. A key is just
-;; EDN — derive your own, e.g. [:summarize prompt]:
-(c/submit sup
-          {:prompt p
-           :dj.concurrency/durable-key [:summarize p]}
-          #(call-llm p))
-```
-
-On execution the worker checks the store *before* running your function. A **hit** resolves the future with the cached value (the task is annotated `:cached? true`, visible via `(c/task f)`). A **miss** runs the function, **durably persists the result before the future resolves**, then resolves it — so once `@f` returns, the result is on disk.
-
-Keys are stored **verbatim** — there's no hashing step, so a durable journal stays introspectable (you can read it and see exactly which inputs produced which result). Clojure value-equality decides hits, so map key order is irrelevant. Identical inputs dedupe by design; add a run-id to the key (e.g. `[:summarize run-id p]`) if you want distinct runs to re-execute. If your inputs are large and you don't need the introspection, hash them yourself and use the digest as the key.
-
-### Durable across restarts with dj.recorder
-
-`atom-store` isn't durable. For crash recovery, back the store with a journal such as [`dj.recorder`](https://github.com/bmillare/dj.recorder). The protocol ships here (zero dependencies); the `dj.recorder`-backed adapter lives with `dj.recorder` (namespace `dj.recorder.concurrency-store`) so `dj.concurrency` stays dependency-free:
-
-```clojure
-(require '[dj.recorder :as r]
-         '[dj.recorder.concurrency-store :as cs])
-
-(def db  (r/open "results.edn"))
-(def sup (c/create-supervisor {:name "llm"
-                               :store (cs/recorder-store db [:results "run-42"])}))
-;; run the pipeline; kill the JVM mid-run; restart; re-run the SAME pipeline with
-;; the SAME run-id — completed chunks resolve as :cached? true, hitting no API.
-```
-
-### Notes & guarantees
-
-- **Store failures never fail a task.** Any throw from the store degrades to no-cache (the function runs normally) and is reported through your `:event-tap` as `:store-lookup-failed` / `:store-record-failed`. Persisted-before-resolved is the guarantee on the happy path.
-- **`nil` and `false` are cached.** Results travel in a `{:result r}` envelope, so a cached `nil`/`false` is a genuine hit, not a miss.
-- **Side-effecting tasks just omit the key.** No `:store` or no `:dj.concurrency/durable-key` → identical to today; UI updates and other effects shouldn't be memoized.
-- **Failures write nothing.** A keyed task that throws parks/retries exactly as before; only successful results are recorded.
-- **Stale memo?** `c/retry` on a task whose key already has an entry returns the memo. If the cached value is stale (e.g. the prompt template changed), `(c/evict! sup k)` first, then retry.
-- **REPL mocks are never persisted, intentionally.** `deliver-result` flows through the resolve path, not the worker, so a mock never poisons the durable cache.
-
-## API Quick Reference
-
-**Setup & Execution:**
-- `create-supervisor` `{:policy :event-tap :name :store :backoff-fn :max-attempts ...}` → Returns a supervisor map (plays nicely with Component/Integrant). Pass `:store` (a `dj.concurrency.store/ResultStore`) to enable durable memoization.
-- `submit` `[sup context function]` → Returns a future (supports `@`, 3-arg `deref` timeouts, and `realized?`). Put `:dj.concurrency/durable-key` in `context` to memoize the result.
-- `stop!` `[sup]` or `[sup mode]` → Stops the supervisor (modes: `:abort-pending` or `:drop`).
-- `wait-for-shutdown` `[sup]` → Returns a promise that resolves when everything is fully stopped.
-
-**Durable memoization (`dj.concurrency.store`):**
-- `ResultStore` protocol — `lookup`, `record!`, `evict!`. Implement it over any journal.
-- `atom-store` → non-durable in-memory store (tests / process memoization).
-- Keys are plain EDN, stored verbatim (no helper needed) — e.g. `[:summarize prompt]`.
-
-**Inspection (REPL / reconcile loop):**
-- `state`, `tasks`, `task`, `parked-tasks`, `tasks-by-status` (`{status [task ...]}` — the one-call lens for a poll loop)
-
-**Intervention (REPL):**
-- `deliver-result`, `retry`, `abort`, `cancel`, `clear-throttle`, `prune`, `evict!`
-
-## Logging
-
-`dj.concurrency` doesn't force a logging framework on you. Internal events are sent to an `:event-tap` you define when creating the supervisor.
-
-By default, it uses **`default-event-tap`**: a loud dev breadcrumb that prints every event to `*err*` the instant it is emitted, so a run never parks in silence. It's a development aid, not a production logging strategy — in production, pass your own `:event-tap`:
-
-```clojure
-;; Send events to your app's actual logger:
-(c/create-supervisor {:event-tap (fn [entry] (my-logger/info entry))})
-
-;; Or restore the old silent-by-default behavior (routes to clojure.core/tap>,
-;; a no-op unless you register a tap listener with (add-tap ...)):
-(c/create-supervisor {:event-tap tap>})
-```
-*(Log entries look like: `{:level :debug :event :submit-executed :task-id <id> :data <task-id>}`. Every task-scoped event carries a top-level `:task-id` — `(:task-id entry)` is the reliable handle to feed an intervention, whatever the `:data` shape. Genuinely supervisor-scoped events like `:pruned` have no `:task-id`.)*
-
-The `:event-tap` is the supervisor's **event tap** — the one place a running
-supervisor's lifecycle transitions escape to observers. The events most worth
-watching (they make retry/throttle behavior legible, e.g. a retry-storm against a
-saturated backend) are:
-
-| `:event` | `:level` | `:data` | meaning |
-|---|---|---|---|
-| `:submit-executed` | `:debug` | task-id | task handed to a worker thread |
-| `:retry-scheduled` | `:debug` | `{:task-id :attempt :max-attempts :wake-in-ms}` | a transient failure will be retried after a backoff |
-| `:throttle-wait` | `:info` | `{:task-id :wake-in-ms}` | a 429 paused the **whole supervisor** for `:wake-in-ms` |
-| `:parked` | `:info` | task-id | retries exhausted; the task awaits intervention (see `parked-tasks`) |
-
-Following `:retry-scheduled` in the tap is how you *see* — rather than infer from a
-hang — that a slow local/single-worker backend is being retried into deeper
-saturation. The rich, authoritative state for a parked task (its `:context`,
-`:error`, attempt count) lives in `(parked-tasks sup)`; the tap is a low-latency
-doorbell, `parked-tasks` is the source of truth.
-
-## Reacting to events (co-supervision)
-
-To have a program (or coding agent) *react* — retry, abort, notify — rather than
-just watch, use two layers. **Build correctness on the poll; use the tap only for
-speed.**
-
-- **Poll + reconcile — authoritative.** On a cadence you own, read
-  `(tasks-by-status sup)`, decide, and act via the interventions (`retry`,
-  `deliver-result`, `abort`, `cancel`, `prune`). This never misses; a run left
-  entirely to this loop is *correct*, just less responsive.
-- **The tap — responsiveness, lossy.** The `:event-tap` shrinks the latency between
-  "task parked" and "you react," but it is best-effort: never build correctness on
-  it. A missed edge must be caught by the next reconcile pass.
-
-The tap is a **notification sink**, not the place to act — three reasons that all
-point at the same recipe:
-
-1. It runs **synchronously on the supervisor's control thread** — a blocking tap
-   wedges the whole supervisor (throttle/admission deadlines stop clearing). Keep it
-   fast and non-blocking.
-2. It receives an `entry`, not `sup` — and `sup` doesn't exist until
-   `create-supervisor` returns — so it *can't* call `(retry sup id)` directly.
-3. It's lossy, so acting from it isn't enough anyway.
-
-So: the tap hands attention-worthy entries to your own queue; a servicer virtual
-thread (created after `sup`, closing over it) drains the queue and acts — off the
-control thread, with `sup` in hand, using `(:task-id entry)` as the handle.
-
-```clojure
-(def attention-q (java.util.concurrent.LinkedBlockingQueue.))
-
-;; edge: a pure, non-blocking sink — your own filter is your policy
-(def sup (c/create-supervisor
-           {:event-tap (fn [entry]
-                         (when (#{:parked} (:event entry))     ; what YOU care about
-                           (.offer attention-q entry)))}))     ; fast, never blocks
-
-;; servicer: owns sup + may block, off the control thread
-(Thread/startVirtualThread
-  (fn [] (while true
-           (let [entry (.take attention-q)]                    ; blocks safely here
-             (c/retry sup (:task-id entry))))))                ; reliable handle
-
-;; level: the authoritative backstop — reconcile on your own cadence
-(doseq [t (:parked (c/tasks-by-status sup))]
-  (c/retry sup (:task-id t)))
-```
-
-Deciding *which* events matter (and what to do about them) is your policy — the
-library ships the channel, the poll surface, and the verbs, and stays out of the
-judgment.
-
-## Customizing policy
-
-Under the hood, the supervisor uses a state machine. It is driven by a pure function that takes the current state and an event, and returns the next state alongside instructions (like "spawn a thread" or "resolve a future").
-
-Most of the time, you don't need to write a custom policy. You can just pass options like `:backoff-fn`, `:max-attempts`, `:classify-error`, or `:default-throttle-ms` to `create-supervisor`. 
-
-If you *do* need total control over how tasks are managed, you can write your own state transition function and pass it as the `:policy`. Check out `default-policy` and `make-reference-policy` (re-exported from `dj.concurrency`, implemented in [`src/dj/concurrency/policy.clj`](src/dj/concurrency/policy.clj)) to see how the default state machine handles things like success, failure, REPL interventions, and shutdown.
-
-> **Internals:** the code is split into a functional core and an imperative shell — [`dj.concurrency.policy`](src/dj/concurrency/policy.clj) is the pure state machine, [`dj.concurrency.shell`](src/dj/concurrency/shell.clj) is the impure runtime (event queue, virtual threads, the future handle), and [`dj.concurrency`](src/dj/concurrency.clj) is the thin user-facing facade. You only ever require `dj.concurrency`.
-
-## Developing on this repo
-
-```bash
-nix develop            # clojure + babashka + jdk 21
-clojure -X:test        # run the test suite
-clojure -M:repl        # dev REPL (adds dev/ and test/ to the path)
-```
+- **[Bounding concurrency to a slow backend](README_AGENTS.md#bounding-concurrency-to-a-slow-backend-recipe)** — a one-semaphore recipe for when the backend can only serve a few requests at once (a different axis from retry/throttle).
+- **[Durable results / crash recovery](README_AGENTS.md#durable-results--crash-recovery)** — an opt-in, crash-safe memo table: after a crash, re-run the same workflow and completed work resolves instantly from a journal instead of re-executing (e.g. no re-paying for 49 of 50 LLM calls).
+- **[Logging & the event tap](README_AGENTS.md#logging--the-event-tap)** + the **[full event vocabulary](README_AGENTS.md#the-event-vocabulary-full-reference)** — how lifecycle transitions reach you, and every event the supervisor emits.
+- **[Reacting to events (co-supervision)](README_AGENTS.md#reacting-to-events-co-supervision)** — driving retries/aborts programmatically with a poll+tap pattern.
+- **[Customizing policy](README_AGENTS.md#customizing-policy)** — `:classify-error`, backoff, and writing your own state machine.
+- **[Architecture](README_AGENTS.md#architecture-functional-core--imperative-shell)**, **[task lifecycle & statuses](README_AGENTS.md#task-lifecycle--statuses)**, the **[API reference](README_AGENTS.md#api-reference)**, and **[developing on this repo](README_AGENTS.md#developing-on-this-repo)**.
 
 ## License
 
