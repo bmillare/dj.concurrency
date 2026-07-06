@@ -161,6 +161,40 @@
       (is (= (set (keys (c/parked-tasks sup)))
              (set (map :task-id (:parked by))))))))
 
+(deftest explain-stuck-summarizes-parked-tasks
+  (testing "explain-stuck condenses the parked set into a flat, pprint-friendly summary"
+    (let [sup {:state (atom {:tasks
+                             {"old" {:task-id "old" :status :parked :submitted-at 0
+                                     :error (ex-info "upstream 503" {:type :transient})
+                                     :context {:dj.concurrency/attempts 5
+                                               :dj.concurrency/durable-key "summarize:doc-42"}}
+                              "new" {:task-id "new" :status :parked :submitted-at 1000
+                                     :error (ex-info "connection reset" {:type :transient})
+                                     :context {:dj.concurrency/attempts 5}}
+                              ;; non-parked tasks are excluded from the summary
+                              "run" {:task-id "run" :status :running :submitted-at 0}}})}
+          {:keys [parked-count tasks]} (c/explain-stuck sup)]
+      (is (= 2 parked-count) "counts only parked tasks")
+      (is (= 2 (count tasks)))
+      (is (= ["old" "new"] (mapv :task-id tasks)) "sorted oldest-first (largest :age-ms)")
+      (let [t (first tasks)]
+        (is (= 5 (:attempts t)) "attempts pulled from internal :context key path")
+        (is (= "upstream 503" (:error t)) "error is the message string, not the Throwable")
+        (is (= :transient (:error-type t)) "classifier tag pulled from ex-data")
+        (is (= "summarize:doc-42" (:durable-key t)))
+        (is (pos? (:age-ms t)) "age derived from :submitted-at"))
+      (is (nil? (:durable-key (second tasks))) ":durable-key is nil when the task isn't memoized")
+      ;; the whole point: no Throwable / closure leaks — every value is pprint-safe
+      (is (every? (fn [t] (every? #(or (nil? %) (string? %) (number? %) (keyword? %))
+                                  (vals t)))
+                  tasks)
+          "every field value is a plain string/number/keyword/nil"))))
+
+(deftest explain-stuck-empty
+  (testing "no parked tasks -> {:parked-count 0 :tasks []}"
+    (let [sup {:state (atom {:tasks {"r" {:task-id "r" :status :running}}})}]
+      (is (= {:parked-count 0 :tasks []} (c/explain-stuck sup))))))
+
 (deftest fatal-failure-aborts
   (testing "a fatal (business) error aborts immediately, no retry"
     (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))

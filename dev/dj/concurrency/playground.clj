@@ -30,7 +30,8 @@
                                  => Always use (deref f timeout-ms timeout-val),
                                     or run a co-supervisor that services parks."
   (:require [dj.concurrency :as c]
-            [dj.concurrency.policy :as policy])
+            [dj.concurrency.policy :as policy]
+            [clojure.pprint :as pp])
   (:import [java.util.concurrent Executors ExecutorService Future TimeUnit
             TimeoutException Semaphore]))
 
@@ -100,22 +101,20 @@
 ;; 3. explain-stuck — print-friendly view over parked-tasks (Phase-1 SP1/V-C)
 ;; =============================================================================
 
+;; GRADUATED: the pure-data summary now ships as `c/explain-stuck` (V-C). This
+;; playground keeps a thin print wrapper — the `print-stuck` breadcrumb the design
+;; doc anticipated — that pretty-prints the graduated fn's return value. Returns
+;; the parked count so the demo call sites are unchanged.
 (defn explain-stuck
-  "Human-readable dump of (c/parked-tasks sup): the AUTHORITATIVE todo list a
-   co-supervisor reconciles against. The tap is a doorbell (lossy, low-latency);
-   THIS is the source of truth (never lossy). Returns the parked count."
+  "Pretty-prints `(c/explain-stuck sup)` — the opinionated, pure-data summary over
+   the AUTHORITATIVE parked set (never lossy, unlike the tap doorbell). Returns the
+   parked count."
   [sup]
-  (let [parked (c/parked-tasks sup)]
-    (if (empty? parked)
+  (let [{:keys [parked-count tasks]} (c/explain-stuck sup)]
+    (if (zero? parked-count)
       (println "  (no parked tasks)")
-      (doseq [[id t] parked]
-        (println (format "  PARKED %s  attempts=%s  error=%s"
-                         (shorten id)
-                         (get-in t [:context :dj.concurrency/attempts])
-                         (some-> (:error t) ex-message)))
-        (println (format "         context=%s" (pr-str (dissoc (:context t)
-                                                               :dj.concurrency/attempts))))))
-    (count parked)))
+      (pp/pprint tasks))
+    parked-count))
 
 ;; =============================================================================
 ;; 4. Simulated slow backend (deterministic, no infra); default = ONE worker

@@ -203,6 +203,50 @@
   [sup]
   (group-by :status (vals (tasks sup))))
 
+(defn explain-stuck
+  "Returns an opinionated, pretty-printable summary of the supervisor's PARKED
+   tasks — the authoritative \"needs a human/agent\" set that will otherwise block
+   `deref` forever. The pull / level-triggered companion to the push /
+   edge-triggered `:event-tap`: the tap tells you WHEN something parks (lossy);
+   this shows you WHAT is parked right now (never lossy).
+
+   Returns `{:parked-count n :tasks [task ...]}` where each task is a flat,
+   plain-value map
+
+     {:task-id :attempts :error <msg-string> :error-type :durable-key :age-ms}
+
+   sorted oldest-first (largest `:age-ms`). Pure data: `pprint` it at a REPL, or
+   filter/reconcile off `:tasks` in a co-supervisor, e.g.
+
+     (->> (explain-stuck sup) :tasks (filter …) (run! #(retry sup (:task-id %))))
+
+   It condenses the raw parked-task maps — flattening the `:error` Throwable to
+   its message string, pulling attempts/durable-key out of internal `:context`
+   key paths, and deriving age from `:submitted-at` — so no field values are
+   Throwables or closures (unlike the raw `parked-tasks` map). The map return
+   grows by adding keys, so callers that destructure `:tasks` stay stable.
+
+   Scopes to `:parked` only — the set that needs intervention. `:waiting-retry`
+   is self-healing and `:queued`/`:running` are progressing; for the fuller
+   picture use `tasks-by-status`."
+  [sup]
+  (let [now   (System/currentTimeMillis)
+        tasks (->> (parked-tasks sup)
+                   (map (fn [[id t]]
+                          (let [err (:error t)]
+                            {:task-id     id
+                             :attempts    (get-in t [:context :dj.concurrency/attempts])
+                             :error       (some-> err ex-message)
+                             :error-type  (:type (ex-data err))
+                             :durable-key (get-in t [:context :dj.concurrency/durable-key])
+                             :age-ms      (when-let [s (:submitted-at t)] (- now s))})))
+                   ;; oldest-first: largest age reads first. `compare` is nil-safe
+                   ;; (nil sorts last) in case a task ever lacks :submitted-at.
+                   (sort-by :age-ms #(compare %2 %1))
+                   vec)]
+    {:parked-count (count tasks)
+     :tasks        tasks}))
+
 ;; --- Printing + datafy/nav ---
 ;;
 ;; A ManageableFuture is a *handle*, not data: printing one must never dump the

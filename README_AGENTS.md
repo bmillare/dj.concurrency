@@ -366,6 +366,52 @@ Deciding *which* events matter (and what to do about them) is your policy — th
 library ships the channel (`:event-tap`), the poll surface (`tasks-by-status` et al.),
 and the verbs (the interventions), and stays out of the judgment.
 
+### `explain-stuck` — a legible read over the parked set
+
+`(explain-stuck sup)` is the pull / level-triggered companion to the push /
+edge-triggered tap. Where the tap tells you *when* something parks (lossy, live), this
+answers *"what is parked right now, and why?"* off the authoritative poll surface
+(never lossy). It's an opinionated **summary** over `parked-tasks` — not a new
+primitive — so it makes no policy decisions and can't be wrong about them.
+
+The value is legibility. A raw parked-task map is hostile to read: attempts hide at
+`[:context :dj.concurrency/attempts]`, the durable key at
+`[:context :dj.concurrency/durable-key]`, the failure is a stack-traced `Throwable`
+under `:error`, and printing it dumps closures and nested policy state.
+`explain-stuck` condenses each parked task to flat, plain values and returns pure,
+pretty-printable data:
+
+```clojure
+(explain-stuck sup)
+;=> {:parked-count 2
+;    :tasks [{:task-id "a3f1…" :attempts 5 :error "upstream 503"
+;             :error-type :transient :durable-key "summarize:doc-42" :age-ms 3200}
+;            {:task-id "b8c2…" :attempts 5 :error "connection reset"
+;             :error-type :transient :durable-key nil :age-ms 900}]}
+```
+
+- **`:tasks` is sorted oldest-first** (largest `:age-ms`) — the longest-stuck task, the
+  one most likely to need you, reads first.
+- **Every field is a value** (string / int / keyword / nil) — the `:error` is
+  `ex-message`, never the Throwable; `:error-type` is the classifier tag from
+  `ex-data`; `:durable-key` is the store handle for `(evict! sup key)` before a
+  `retry` (nil when the task isn't memoized).
+- **A map, not a bare vector**, so aggregate fields can be added later without breaking
+  callers that destructure `:tasks`.
+
+At a REPL it auto-pretty-prints; a co-supervisor reconciles off the same value:
+
+```clojure
+(->> (explain-stuck sup) :tasks
+     (filter #(= :transient (:error-type %)))
+     (run! #(c/retry sup (:task-id %))))
+```
+
+Scope: `:parked` only — the set that will otherwise block `deref` forever.
+`:waiting-retry` is self-healing and `:queued`/`:running` are progressing; for the
+fuller picture use `tasks-by-status`. `explain-stuck` doesn't push or notify — if you
+never call it you learn nothing; that half is the tap's job.
+
 ---
 
 ## Customizing policy
@@ -427,6 +473,10 @@ keep it pure — all side effects happen in the shell via the directives it retu
 - `parked-tasks` `[sup]` — `{task-id task-map}` restricted to `:parked`.
 - `tasks-by-status` `[sup]` — `{status [task-map ...]}`, the one-call lens for a poll
   loop (a filter, not a verdict).
+- `explain-stuck` `[sup]` — `{:parked-count n :tasks [{:task-id :attempts :error
+  :error-type :durable-key :age-ms} …]}`, an opinionated, pretty-printable summary of
+  the parked set (oldest-first, all plain values). The level-triggered read; pairs with
+  the edge-triggered `:event-tap`.
 
 **Intervention (REPL / co-supervisor)** — each takes `[f]` or `[sup task-id]`:
 - `retry` — re-run a parked/waiting/queued task with a fresh attempt budget.
