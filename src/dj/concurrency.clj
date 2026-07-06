@@ -37,7 +37,10 @@
    route entries into your logger/telemetry, `tap>` for the old silent behavior,
    or a level filter of your own.
 
-   Entry shape (the raw contract, unchanged): `{:level kw :event kw :data any}`."
+   Entry shape (the raw contract): `{:level kw :event kw :data any}`, plus a
+   top-level `:task-id` on every task-scoped event (nil/absent for genuinely
+   supervisor-scoped events like `:pruned`/`:unknown-event`). `(:task-id entry)`
+   is the reliable handle to feed an intervention — see `create-supervisor`."
   [{:keys [level event data]}]
   (binding [*out* *err*]
     (println (format "dj.concurrency %-6s %-18s %s"
@@ -56,6 +59,19 @@
                  observers. Defaults to `default-event-tap` (a loud dev
                  breadcrumb to `*err*`). Pass `tap>` for the old silent
                  default, or your own fn to route into a logger.
+
+                 CONTRACT: the tap is called SYNCHRONOUSLY, on the supervisor's
+                 single control thread. It MUST be fast and non-blocking — do no
+                 I/O, don't deref a task, don't acquire locks. A throw is
+                 swallowed, but a BLOCK wedges the whole supervisor (the control
+                 loop stops polling AND stops clearing throttle/admission
+                 deadlines). To react (retry/abort/notify), hand the entry to
+                 your own queue or virtual thread and act from there — the tap is
+                 a notification sink, not the place to do work. Entries carry a
+                 top-level `:task-id` for task-scoped events, so a reactor uses
+                 `(:task-id entry)` as the handle. The tap is LOSSY/best-effort:
+                 build correctness on a poll+reconcile loop (see `tasks-by-status`
+                 / `parked-tasks`) and use the tap only to react sooner.
      :store    - Optional dj.concurrency.store/ResultStore. When present, tasks
                  whose context contains :dj.concurrency/durable-key are memoized:
                  a prior recorded result short-circuits execution and resolves
@@ -172,6 +188,20 @@
   "Returns a map of all parked tasks awaiting REPL intervention."
   [sup]
   (into {} (filter (fn [[_ t]] (= :parked (:status t))) (tasks sup))))
+
+(defn tasks-by-status
+  "Groups the supervisor's tasks by `:status`, returning
+   `{status [task ...]}` (e.g. `:parked`, `:queued`, `:waiting-retry`,
+   `:running`, `:resolved`, `:aborted`, `:cancelled`).
+
+   The one-call lens for a co-supervisor's poll+reconcile loop: read it on your
+   own cadence, decide per group, and act via the interventions (`retry`,
+   `deliver-result`, `abort`, `cancel`, `prune`). This is authoritative and never
+   misses — unlike the `:event-tap`, which is lossy and only improves latency. It
+   is a filter, not a verdict: what each group means is your policy, not the
+   library's."
+  [sup]
+  (group-by :status (vals (tasks sup))))
 
 ;; --- Printing + datafy/nav ---
 ;;

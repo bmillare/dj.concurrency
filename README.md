@@ -304,8 +304,8 @@ Keys are stored **verbatim** — there's no hashing step, so a durable journal s
 - `atom-store` → non-durable in-memory store (tests / process memoization).
 - Keys are plain EDN, stored verbatim (no helper needed) — e.g. `[:summarize prompt]`.
 
-**Inspection (REPL):**
-- `state`, `tasks`, `task`, `parked-tasks`
+**Inspection (REPL / reconcile loop):**
+- `state`, `tasks`, `task`, `parked-tasks`, `tasks-by-status` (`{status [task ...]}` — the one-call lens for a poll loop)
 
 **Intervention (REPL):**
 - `deliver-result`, `retry`, `abort`, `cancel`, `clear-throttle`, `prune`, `evict!`
@@ -324,7 +324,7 @@ By default, it uses **`default-event-tap`**: a loud dev breadcrumb that prints e
 ;; a no-op unless you register a tap listener with (add-tap ...)):
 (c/create-supervisor {:event-tap tap>})
 ```
-*(Log entries look like: `{:level :debug :event :submit-executed :data <task-id>}`)*
+*(Log entries look like: `{:level :debug :event :submit-executed :task-id <id> :data <task-id>}`. Every task-scoped event carries a top-level `:task-id` — `(:task-id entry)` is the reliable handle to feed an intervention, whatever the `:data` shape. Genuinely supervisor-scoped events like `:pruned` have no `:task-id`.)*
 
 The `:event-tap` is the supervisor's **event tap** — the one place a running
 supervisor's lifecycle transitions escape to observers. The events most worth
@@ -343,6 +343,58 @@ hang — that a slow local/single-worker backend is being retried into deeper
 saturation. The rich, authoritative state for a parked task (its `:context`,
 `:error`, attempt count) lives in `(parked-tasks sup)`; the tap is a low-latency
 doorbell, `parked-tasks` is the source of truth.
+
+## Reacting to events (co-supervision)
+
+To have a program (or coding agent) *react* — retry, abort, notify — rather than
+just watch, use two layers. **Build correctness on the poll; use the tap only for
+speed.**
+
+- **Poll + reconcile — authoritative.** On a cadence you own, read
+  `(tasks-by-status sup)`, decide, and act via the interventions (`retry`,
+  `deliver-result`, `abort`, `cancel`, `prune`). This never misses; a run left
+  entirely to this loop is *correct*, just less responsive.
+- **The tap — responsiveness, lossy.** The `:event-tap` shrinks the latency between
+  "task parked" and "you react," but it is best-effort: never build correctness on
+  it. A missed edge must be caught by the next reconcile pass.
+
+The tap is a **notification sink**, not the place to act — three reasons that all
+point at the same recipe:
+
+1. It runs **synchronously on the supervisor's control thread** — a blocking tap
+   wedges the whole supervisor (throttle/admission deadlines stop clearing). Keep it
+   fast and non-blocking.
+2. It receives an `entry`, not `sup` — and `sup` doesn't exist until
+   `create-supervisor` returns — so it *can't* call `(retry sup id)` directly.
+3. It's lossy, so acting from it isn't enough anyway.
+
+So: the tap hands attention-worthy entries to your own queue; a servicer virtual
+thread (created after `sup`, closing over it) drains the queue and acts — off the
+control thread, with `sup` in hand, using `(:task-id entry)` as the handle.
+
+```clojure
+(def attention-q (java.util.concurrent.LinkedBlockingQueue.))
+
+;; edge: a pure, non-blocking sink — your own filter is your policy
+(def sup (c/create-supervisor
+           {:event-tap (fn [entry]
+                         (when (#{:parked} (:event entry))     ; what YOU care about
+                           (.offer attention-q entry)))}))     ; fast, never blocks
+
+;; servicer: owns sup + may block, off the control thread
+(Thread/startVirtualThread
+  (fn [] (while true
+           (let [entry (.take attention-q)]                    ; blocks safely here
+             (c/retry sup (:task-id entry))))))                ; reliable handle
+
+;; level: the authoritative backstop — reconcile on your own cadence
+(doseq [t (:parked (c/tasks-by-status sup))]
+  (c/retry sup (:task-id t)))
+```
+
+Deciding *which* events matter (and what to do about them) is your policy — the
+library ships the channel, the poll surface, and the verbs, and stays out of the
+judgment.
 
 ## Customizing policy
 

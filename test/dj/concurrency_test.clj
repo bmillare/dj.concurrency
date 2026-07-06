@@ -120,6 +120,47 @@
         (is (= :info (:level log)) "supervisor-wide pause is :info, not :debug")
         (is (= 3000 (get-in log [:data :wake-in-ms])) ":wake-in-ms is the throttle window")))))
 
+(deftest entries-carry-top-level-task-id
+  (testing "task-scoped events expose (:task-id entry) as the reliable reactor handle,
+            regardless of whether :data is a bare id or a map"
+    ;; bare-:data event (:parked) — data IS the id, top-level mirrors it
+    (let [state (assoc-in base-state [:tasks "t1"]
+                          (running-task "t1" {::c/attempts 3 ::c/max-attempts 3}))
+          {dirs :directives} (c/default-policy [:failed {:task-id "t1"
+                                                         :error (ex-info "boom" {})
+                                                         :now 1}] state)
+          [_ log] (find-dir dirs :log)]
+      (is (= :parked (:event log)))
+      (is (= "t1" (:task-id log)) "top-level :task-id present on a bare-:data event"))
+    ;; map-:data event (:retry-scheduled) — top-level :task-id alongside the map
+    (let [state (assoc-in base-state [:tasks "t2"] (running-task "t2" {::c/attempts 1}))
+          {dirs :directives} (c/default-policy [:failed {:task-id "t2"
+                                                         :error (ex-info "boom" {})
+                                                         :now 1}] state)
+          [_ log] (find-dir dirs :log)]
+      (is (= :retry-scheduled (:event log)))
+      (is (= "t2" (:task-id log)) "top-level :task-id present on a map-:data event"))
+    ;; misuse event (:no-such-task) is still task-scoped — the id the caller asked for
+    (let [{dirs :directives} (c/default-policy [:repl/retry {:task-id "ghost" :now 1}]
+                                               base-state)
+          [_ log] (find-dir dirs :log)]
+      (is (= :no-such-task (:event log)))
+      (is (= "ghost" (:task-id log))))))
+
+(deftest tasks-by-status-groups-the-poll-surface
+  (testing "tasks-by-status groups tasks by :status for a reconcile loop"
+    (let [sup {:state (atom {:tasks {"a" {:task-id "a" :status :parked}
+                                     "b" {:task-id "b" :status :parked}
+                                     "c" {:task-id "c" :status :running}
+                                     "d" {:task-id "d" :status :queued}}})}
+          by  (c/tasks-by-status sup)]
+      (is (= #{:parked :running :queued} (set (keys by))))
+      (is (= 2 (count (:parked by))))
+      (is (= #{"a" "b"} (set (map :task-id (:parked by)))))
+      ;; agrees with the park-only shortcut
+      (is (= (set (keys (c/parked-tasks sup)))
+             (set (map :task-id (:parked by))))))))
+
 (deftest fatal-failure-aborts
   (testing "a fatal (business) error aborts immediately, no retry"
     (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))

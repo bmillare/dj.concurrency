@@ -87,20 +87,20 @@
 
 (defn- safe-lookup
   "Store lookup that degrades to a miss on any throw."
-  [sup s k]
+  [sup task-id s k]
   (try (store/lookup s k)
        (catch Throwable t
-         (safe-log! sup {:level :warn :event :store-lookup-failed
+         (safe-log! sup {:level :warn :event :store-lookup-failed :task-id task-id
                          :data {:key k :error t}})
          nil)))
 
 (defn- safe-record!
   "Store persist that degrades to 'not memoized' on any throw.
    Blocks until durable on success (persist-then-publish)."
-  [sup s k entry]
+  [sup task-id s k entry]
   (try (store/record! s k entry)
        (catch Throwable t
-         (safe-log! sup {:level :warn :event :store-record-failed
+         (safe-log! sup {:level :warn :event :store-record-failed :task-id task-id
                          :data {:key k :error t}}))))
 
 (defn- execute-worker-wrapper
@@ -114,14 +114,14 @@
   (let [start (System/currentTimeMillis)
         k     (:dj.concurrency/durable-key context)]
     (try
-      (if-let [hit (when (and store k) (safe-lookup sup store k))]
+      (if-let [hit (when (and store k) (safe-lookup sup task-id store k))]
         (.put queue [:success {:task-id  task-id
                                :result   (:result hit)
                                :cached?  true
                                :duration (- (System/currentTimeMillis) start)}])
         (let [result (closure)]
           (when (and store k)
-            (safe-record! sup store k {:result result}))
+            (safe-record! sup task-id store k {:result result}))
           (.put queue [:success {:task-id  task-id
                                  :result   result
                                  :duration (- (System/currentTimeMillis) start)}])))

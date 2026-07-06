@@ -72,7 +72,7 @@
                               (< now (:throttle-expires-at state)))]
           (if throttled?
             ;; S2: Throttled
-            {:directives [[:log {:level :info :event :submit-throttled :data task-id}]]
+            {:directives [[:log {:level :info :event :submit-throttled :task-id task-id :data task-id}]]
              :state (assoc-in state [:tasks task-id]
                               {:task-id task-id, :status :queued
                                ;; Seed ::attempts like S3 so a later failure never
@@ -86,14 +86,14 @@
                 ;; S3b: Bounded — enter the admission queue (like the throttled S2
                 ;; path, but on the concurrency axis). scan-deadlines admits it
                 ;; the moment a permit is free (often the same pass).
-                {:directives [[:log {:level :debug :event :submit-queued :data task-id}]]
+                {:directives [[:log {:level :debug :event :submit-queued :task-id task-id :data task-id}]]
                  :state (assoc-in state [:tasks task-id]
                                   {:task-id task-id, :status :queued
                                    :context ctx', :closure (:closure payload)
                                    :submitted-at (:submitted-at payload)})}
                 ;; S3a: Unbounded — unchanged direct dispatch.
                 {:directives [[:execute {:task-id task-id :context ctx' :closure (:closure payload)}]
-                              [:log {:level :debug :event :submit-executed :data task-id}]]
+                              [:log {:level :debug :event :submit-executed :task-id task-id :data task-id}]]
                  :state (assoc-in state [:tasks task-id]
                                   {:task-id task-id, :status :running
                                    :context ctx', :closure (:closure payload)
@@ -104,7 +104,7 @@
       (cond
         ;; K1: Late/Ignored
         (or (nil? t) (terminal-statuses status))
-        {:directives [[:log {:level :warn :event :late-success :data task-id}]] :state state}
+        {:directives [[:log {:level :warn :event :late-success :task-id task-id :data task-id}]] :state state}
 
         ;; K2: Expected Success
         (= :running status)
@@ -118,14 +118,14 @@
 
         ;; K3: Illegal
         :else
-        {:directives [[:log {:level :warn :event :illegal-transition :data task-id}]] :state state})
+        {:directives [[:log {:level :warn :event :illegal-transition :task-id task-id :data task-id}]] :state state})
 
       ;; --- F: Failed ---
       :failed
       (cond
         ;; F1: Late/Ignored
         (or (nil? t) (terminal-statuses status))
-        {:directives [[:log {:level :warn :event :late-failure :data task-id}]] :state state}
+        {:directives [[:log {:level :warn :event :late-failure :task-id task-id :data task-id}]] :state state}
 
         (= :running status)
         (let [err-type     ((:classify-error config) (:error payload))
@@ -145,7 +145,7 @@
               ;; supervisor, so it is supervisor-level notable (:info), not a
               ;; routine per-task step. Previously this branch was SILENT, which
               ;; hid the throttle from the tap (see playground finding F1).
-              {:directives [[:log {:level :info :event :throttle-wait
+              {:directives [[:log {:level :info :event :throttle-wait :task-id task-id
                                    :data {:task-id task-id :wake-in-ms window}}]]
                ;; A concurrent, shorter 429 must not shorten a live window, so
                ;; keep the later expiry. A 429 doesn't consume the retry budget
@@ -166,7 +166,7 @@
               ;; exactly what hid pile-up on a saturated single-worker backend
               ;; (playground finding F1). :attempt is the NEXT attempt number.
               (let [backoff ((:backoff-fn config) attempts)]
-                {:directives [[:log {:level :debug :event :retry-scheduled
+                {:directives [[:log {:level :debug :event :retry-scheduled :task-id task-id
                                      :data {:task-id      task-id
                                             :attempt      (inc attempts)
                                             :max-attempts max-attempts
@@ -177,12 +177,12 @@
                             (update-in [:tasks task-id :context :dj.concurrency/attempts] (fnil inc 1)))})
 
               ;; F5: Exhausted / Parked
-              {:directives [[:log {:level :info :event :parked :data task-id}]]
+              {:directives [[:log {:level :info :event :parked :task-id task-id :data task-id}]]
                :state (update-in state [:tasks task-id] assoc :status :parked :error (:error payload))})))
 
         ;; F6: Illegal
         :else
-        {:directives [[:log {:level :warn :event :illegal-transition :data task-id}]] :state state})
+        {:directives [[:log {:level :warn :event :illegal-transition :task-id task-id :data task-id}]] :state state})
 
       ;; --- T: Tick ---
       :tick
@@ -198,7 +198,7 @@
             ;; R1b: Bounded — a co-sup/REPL retry MUST re-acquire through the same
             ;; admission chokepoint, or it re-enters uncounted and LEAKS the bound
             ;; (RC-2/F11, the F10 :on-park leak). So route to :queued; scan admits.
-            {:directives [[:log {:level :debug :event :retry-queued :data task-id}]]
+            {:directives [[:log {:level :debug :event :retry-queued :task-id task-id :data task-id}]]
              :state (update-in state [:tasks task-id] assoc
                                :status :queued :wake-at nil :throttle? nil
                                :context (:context t'))}
@@ -209,9 +209,9 @@
                                :context (:context t'))}))
         ;; R2 & R3
         (= :running status)
-        {:directives [[:log {:level :warn :event :already-running :data task-id}]] :state state}
+        {:directives [[:log {:level :warn :event :already-running :task-id task-id :data task-id}]] :state state}
         :else
-        {:directives [[:log {:level :warn :event :no-such-task :data task-id}]] :state state})
+        {:directives [[:log {:level :warn :event :no-such-task :task-id task-id :data task-id}]] :state state})
 
       ;; --- D: REPL Deliver ---
       ;; Deliver/abort/cancel all clear :wake-at: a terminal task must never leave
@@ -220,14 +220,14 @@
       (if (#{:parked :waiting-retry :queued :running} status)
         {:directives [[:resolve {:task-id task-id :result (:result payload)}]]
          :state (update-in state [:tasks task-id] assoc :status :resolved :wake-at nil)}
-        {:directives [[:log {:level :warn :event :invalid-deliver :data task-id}]] :state state})
+        {:directives [[:log {:level :warn :event :invalid-deliver :task-id task-id :data task-id}]] :state state})
 
       ;; --- A: REPL Abort ---
       :repl/abort
       (if (#{:parked :waiting-retry :queued :running} status)
         {:directives [[:abort {:task-id task-id :error (:error payload)}]]
          :state (update-in state [:tasks task-id] assoc :status :aborted :wake-at nil)}
-        {:directives [[:log {:level :warn :event :invalid-abort :data task-id}]] :state state})
+        {:directives [[:log {:level :warn :event :invalid-abort :task-id task-id :data task-id}]] :state state})
 
       ;; --- C: REPL Cancel ---
       :repl/cancel
@@ -236,13 +236,13 @@
         ;; consumer semantics are unchanged (see `cancel`).
         (#{:parked :waiting-retry :queued} status)
         {:directives [[:drop-cf {:task-id task-id}]
-                      [:log {:level :info :event :cancelled :data task-id}]]
+                      [:log {:level :info :event :cancelled :task-id task-id :data task-id}]]
          :state (update-in state [:tasks task-id] assoc :status :cancelled :wake-at nil)}
         ;; C2 & C3
         (= :running status)
-        {:directives [[:log {:level :warn :event :cannot-cancel-running :data task-id}]] :state state}
+        {:directives [[:log {:level :warn :event :cannot-cancel-running :task-id task-id :data task-id}]] :state state}
         :else
-        {:directives [[:log {:level :warn :event :invalid-cancel :data task-id}]] :state state})
+        {:directives [[:log {:level :warn :event :invalid-cancel :task-id task-id :data task-id}]] :state state})
 
       ;; --- X: REPL Clear Throttle ---
       ;; Lift the window and mark throttle-tagged waiters due, so the
@@ -347,7 +347,7 @@
                        tasks-to-run)
         grant-logs (when W
                      (map-indexed
-                      (fn [i t] [:log {:level :debug :event :admission-granted
+                      (fn [i t] [:log {:level :debug :event :admission-granted :task-id (:task-id t)
                                        :data {:task-id       (:task-id t)
                                               :in-flight      (+ in-flight i 1)
                                               :max-in-flight  W}}])
@@ -357,7 +357,7 @@
         wait-logs (when W
                     (for [t blocked
                           :when (not (:admission-waiting? t))]
-                      [:log {:level :info :event :admission-wait
+                      [:log {:level :info :event :admission-wait :task-id (:task-id t)
                              :data {:task-id       (:task-id t)
                                     :in-flight     in-flight
                                     :max-in-flight W}}]))
