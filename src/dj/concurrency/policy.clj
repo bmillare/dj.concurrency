@@ -30,15 +30,34 @@
   [t]
   (get-in t [:context :dj.concurrency/pool] :default))
 
-(defn default-classify-error
-  "Reference heuristic for classifying errors based on the dispatch table examples.
-   In a production system, supply your own via `make-reference-policy`."
+(defn abort-requested?
+  "True when `error`'s ex-data carries the explicit abort marker
+   `:dj.concurrency/abort` — the zero-config escape hatch a worker throws to end a
+   task terminally (build it with `dj.concurrency/abort-error`). Custom
+   `:classify-error` fns can call this to honor the marker in one line."
   [error]
-  (let [d (ex-data error)]
-    (cond
-      (= (:type d) :business-error) :fatal
-      (= (:status d) 429)           :rate-limited
-      :else                         :transient)))
+  (boolean (:dj.concurrency/abort (ex-data error))))
+
+(defn default-classify-error
+  "Reference heuristic mapping a worker's thrown error to a verdict —
+   `:abort` | `:rate-limited` | `:transient`:
+
+     - explicit `{:dj.concurrency/abort true}` marker -> :abort
+         (terminal escape hatch: the task aborts and `@f` re-throws the error;
+          nothing is retried or parked)
+     - `{:status 429}`                                -> :rate-limited
+         (throttle the task's pool, retry when the window lifts)
+     - anything else                                  -> :transient
+         (retry with backoff, then park)
+
+   It aborts ONLY on the explicit marker: an unrecognized error is assumed
+   recoverable and parks, so fix-forward stays the default. For systematic abort
+   rules (e.g. all 4xx), supply your own via `make-reference-policy`."
+  [error]
+  (cond
+    (abort-requested? error)          :abort
+    (= 429 (:status (ex-data error))) :rate-limited
+    :else                             :transient))
 
 (defn default-backoff
   "Simple exponential backoff (1s, 2s, 4s...) based on attempts."
@@ -142,8 +161,10 @@
               attempts     (get-in t [:context :dj.concurrency/attempts] 1)
               max-attempts (get-in t [:context :dj.concurrency/max-attempts] (:max-attempts config))]
           (case err-type
-            ;; F2: Fatal
-            :fatal
+            ;; F2: Abort — the classifier's escape hatch: end the task terminally
+            ;; (no retry, no park). `@f` re-throws the error the worker raised, so a
+            ;; caller can catch it and read its ex-data.
+            :abort
             {:directives [[:abort {:task-id task-id :error (:error payload)}]]
              :state (update-in state [:tasks task-id] assoc :status :aborted :error (:error payload))}
 
@@ -412,7 +433,7 @@
 (defn make-reference-policy
   "Builds a pure reference policy `(fn [event state] -> {:directives :state})`,
    closing over `opts`. Recognized opts (others ignored):
-     :classify-error      (fn [error] -> :fatal | :rate-limited | :transient)
+     :classify-error      (fn [error] -> :abort | :rate-limited | :transient)
      :backoff-fn          (fn [attempts] -> backoff-ms) for transient retries
      :max-attempts        default max attempts when a task's context omits
                           :dj.concurrency/max-attempts (default 3)

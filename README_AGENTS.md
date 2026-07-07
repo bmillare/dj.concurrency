@@ -160,15 +160,17 @@ Recover vs. give up — the distinction the whole workflow turns on:
 
 A task reaches `:aborted` three ways, none of them a normal retry outcome:
 
-1. **A `:fatal` classification** — your `:classify-error` decides "don't retry this" (the
-   default maps `{:type :business-error}`; see [Customizing policy](#customizing-policy)).
+1. **An `:abort` classification** — a worker throws the `{:dj.concurrency/abort true}`
+   marker (build it with `(abort-error msg data)`) and the default classifier ends the
+   task; or a custom `:classify-error` returns `:abort` (see [Customizing
+   policy](#customizing-policy)).
 2. **A REPL / co-supervisor `abort`** — you decide to give up on a parked task.
 3. **`stop!` in the default `:abort-pending` mode** — shutdown aborts every non-terminal
    task, parked ones included (use `(stop! sup :drop)` to skip that).
 
-A worker exception *by itself* never aborts: it retries and then **parks**. Only a
-`:fatal` verdict turns a failure terminal. So in a fix-forward run you almost always want
-failures to park — reach for abort only when you truly mean "stop, this one is done."
+A worker exception *by itself* never aborts: unless it's classified `:abort`, it retries
+and then **parks**. So in a fix-forward run you almost always want failures to park — reach
+for abort only when you truly mean "stop, this one is done."
 
 Task-map fields you can read from `(task f)` / `(tasks sup)`:
 `:task-id :status :context :closure :submitted-at :wake-at :throttle?
@@ -583,20 +585,25 @@ like `:backoff-fn`, `:max-attempts`, `:classify-error`, or `:default-throttle-ms
   {:name        "llm"
    :max-attempts 5
    :backoff-fn  (fn [attempts] (* 250 attempts))          ; 250ms linear backoff
-   :classify-error (fn [error]                            ; :fatal | :rate-limited | :transient
+   :classify-error (fn [error]                            ; :abort | :rate-limited | :transient
                      (cond
-                       ;; permanently invalid input — never worth a retry; let @f throw
-                       (= :invalid-input (:type (ex-data error))) :fatal
+                       ;; systematic rule: any 4xx is permanently invalid -> abort
+                       (<= 400 (:status (ex-data error)) 499) :abort
                        :else :transient))})
 ```
 
 `:classify-error` is the main extension point: return `:transient` (retry with backoff,
 then park), `:rate-limited` (throttle that pool and retry when the window lifts), or
-`:fatal` (**abort** — terminal, no retry, no park; `@f` re-throws). Reach for `:fatal`
-only as an escape hatch: a failure that's never worth fixing forward, or one your calling
-code is waiting to catch on `deref`. Anything you'd *fix and retry* — a stale token, a
-code bug, a bad prompt — should **park** instead (the default `:transient` path), so you
-can fix forward and `retry`; see [park vs. abort](#park-vs-abort). Per-task overrides go
+`:abort` (**terminal** — no retry, no park; `@f` re-throws). Reach for `:abort` only as an
+escape hatch: a failure that's never worth fixing forward, or one your calling code is
+waiting to catch on `deref`. Anything you'd *fix and retry* — a stale token, a code bug, a
+bad prompt — should **park** instead (the default `:transient` path), so you can fix
+forward and `retry`; see [park vs. abort](#park-vs-abort).
+
+For a *one-off* dead end you don't need a classifier at all: throw
+`(c/abort-error msg data)` from the worker and the **default** classifier aborts on its
+`:dj.concurrency/abort` marker. A custom classifier can honor that same marker via
+`(abort-requested? error)`. Per-task overrides go
 in the context map under the `:dj.concurrency/` namespace (e.g.
 `:dj.concurrency/max-attempts`).
 
@@ -619,6 +626,12 @@ keep it pure — all side effects happen in the shell via the directives it retu
 - `submit` `[sup context function]` — returns a future (supports `@`, 3-arg `deref`
   timeouts, and `realized?`). Put `:dj.concurrency/durable-key` in `context` to
   memoize the result; `:dj.concurrency/max-attempts` to override the retry budget.
+- `abort-error` `[msg]` / `[msg data]` — build an `ex-info` tagged with the
+  `:dj.concurrency/abort` marker; throw it from a worker to abort the task (the escape
+  hatch — the task ends terminally and `@f` re-throws it). See [park vs.
+  abort](#park-vs-abort).
+- `abort-requested?` `[error]` — true if `error` carries the abort marker; for custom
+  `:classify-error` fns that want to honor the escape hatch.
 - `stop!` `[sup]` / `[sup mode]` — stops the supervisor (`mode`: `:abort-pending`
   (default) or `:drop`).
 - `wait-for-shutdown` `[sup]` — returns a promise that resolves when everything is

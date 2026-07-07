@@ -215,15 +215,36 @@
     (let [sup {:state (atom {:tasks {"r" {:task-id "r" :status :running}}})}]
       (is (= {:parked-count 0 :tasks []} (c/explain-stuck sup))))))
 
-(deftest fatal-failure-aborts
-  (testing "a fatal (business) error aborts immediately, no retry"
+(deftest abort-marker-aborts
+  (testing "the :dj.concurrency/abort marker aborts immediately, no retry"
     (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
+          {dirs :directives state' :state}
+          (c/default-policy [:failed {:task-id "t1"
+                                      :error (c/abort-error "bad input" {:status 400})
+                                      :now 1000}] state)]
+      (is (contains? (dir-types dirs) :abort))
+      (is (= :aborted (get-in state' [:tasks "t1" :status]))))))
+
+(deftest unmarked-error-parks-not-aborts
+  (testing "without the abort marker, an exhausted error PARKS (fix-forward default) — a
+            plain domain error like the old :business-error no longer aborts"
+    (let [state (assoc-in base-state [:tasks "t1"]
+                          (running-task "t1" {::c/attempts 1 ::c/max-attempts 1}))
           {dirs :directives state' :state}
           (c/default-policy [:failed {:task-id "t1"
                                       :error (ex-info "bad input" {:type :business-error})
                                       :now 1000}] state)]
-      (is (contains? (dir-types dirs) :abort))
-      (is (= :aborted (get-in state' [:tasks "t1" :status]))))))
+      (is (not (contains? (dir-types dirs) :abort)) "an unmarked error never aborts")
+      (is (= :parked (get-in state' [:tasks "t1" :status]))))))
+
+(deftest abort-error-builds-marker-and-predicate-reads-it
+  (testing "abort-error tags the marker + preserves data; abort-requested? reads it"
+    (let [e (c/abort-error "dead end" {:status 400})]
+      (is (true? (:dj.concurrency/abort (ex-data e))) "marker set")
+      (is (= 400 (:status (ex-data e))) "caller data preserved")
+      (is (c/abort-requested? e)))
+    (is (not (c/abort-requested? (ex-info "x" {:status 500}))) "no marker -> false")
+    (is (not (c/abort-requested? (RuntimeException. "y"))) "non-ex-info -> false")))
 
 (deftest submit-while-throttled-queues
   (testing "submitting into a throttled pool queues instead of executing"
@@ -513,13 +534,15 @@
         (is (= 3 @(c/submit sup {} (fn [] (+ 1 2)))))
         (finally (c/stop! sup))))))
 
-(deftest fatal-error-propagates-on-deref
-  (testing "a business error surfaces to the blocked consumer on deref"
+(deftest abort-error-propagates-on-deref
+  (testing "an aborted task re-throws the worker's ex-info (data intact) on deref"
     (let [sup (c/create-supervisor {})]
       (try
-        (let [f (c/submit sup {} (fn [] (throw (ex-info "bad input"
-                                                        {:type :business-error}))))]
-          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bad input" @f)))
+        (let [f (c/submit sup {} (fn [] (throw (c/abort-error "bad input" {:status 400}))))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bad input" @f))
+          (is (= 400 (:status (ex-data (try @f (catch clojure.lang.ExceptionInfo e e)))))
+              "the caller can read the data off the thrown ex-info")
+          (is (= :aborted (:status (c/task f)))))
         (finally (c/stop! sup))))))
 
 (deftest auto-retry-eventually-succeeds

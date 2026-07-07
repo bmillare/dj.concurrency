@@ -176,17 +176,16 @@ When you write your worker function, you don't write retry logic. Instead, you j
                           {:status 429                  
                            :retry-after (header-ms resp "retry-after")}))
                            
-      ;; Bad request: this is a code bug, retrying won't help
-      (400 401 403)                                     
-          (throw (ex-info "bad request"
-                          {:type :business-error}))     
+      ;; Permanently invalid input — never worth a retry. Abort so @f re-throws
+      ;; this ex-info and the caller can handle it.
+      400 (throw (c/abort-error "invalid request" {:status 400}))
                           
-      ;; 503s, timeouts, etc.: standard errors
+      ;; 503s, timeouts, auth blips, etc.: assume transient -> retry, then park
       (throw (ex-info (str "transient " (:status resp)) {:status (:status resp)})))))
 ```
 
 The supervisor's default policy looks at the keys in your `ex-data`:
-- If it sees `{:type :business-error}`, it treats the failure as **fatal** and **aborts** the task. Abort is terminal — `@f` re-throws the error — so this is the escape hatch for a failure that's *never worth fixing* (or that your calling code wants to catch on `deref`). It is **not** the same as parking, and an aborted task can't be retried; see [park vs. abort](README_AGENTS.md#park-vs-abort).
+- If it sees the `{:dj.concurrency/abort true}` marker — throw one with `(c/abort-error msg data)` — it **aborts** the task. Abort is terminal: `@f` re-throws *your* ex-info (data intact), so this is the escape hatch for a failure that's *never worth fixing*, or one your calling code wants to catch on `deref`. It is **not** parking, and an aborted task can't be retried; see [park vs. abort](README_AGENTS.md#park-vs-abort).
 - If it sees `{:status 429}`, it **throttles** that request's pool (queuing the pool's other requests for the duration of `:retry-after`; with a single default pool that's every request).
 - If it sees anything else, it assumes a transient error and **retries** up to the max attempt limit (default is 3), and then **parks** the task for you to inspect and fix forward.
 

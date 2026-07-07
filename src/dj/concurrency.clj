@@ -151,6 +151,31 @@
                       :cf           cf}])
       stub)))
 
+;; --- Worker-side error helpers ---
+
+(defn abort-error
+  "Builds an `ex-info` carrying the explicit abort marker `:dj.concurrency/abort`.
+   Throw it from a worker to opt a task OUT of the fix-forward loop: the default
+   classifier reads the marker, aborts the task terminally (no retry, no park), and
+   `@f` re-throws THIS ex-info to the consumer — so a caller can `try/catch` it and
+   read `data` off `ex-data`.
+
+     (throw (c/abort-error \"permanently invalid request\" {:status 400 :prompt p}))
+
+   Sugar over `(ex-info msg (assoc data :dj.concurrency/abort true))`. Reach for it
+   only when a failure is a genuine dead end (never worth a retry) or when calling
+   code is meant to handle the throw; anything you'd fix and retry should PARK, the
+   default `:transient` path. Custom `:classify-error` fns can honor the marker via
+   `abort-requested?`."
+  ([msg] (abort-error msg {}))
+  ([msg data] (ex-info msg (assoc data :dj.concurrency/abort true))))
+
+(def ^{:arglists '([error])} abort-requested?
+  "True when `error` carries the `:dj.concurrency/abort` marker (see `abort-error`).
+   The default classifier uses this; custom classifiers can call it to respect the
+   escape hatch in one line."
+  policy/abort-requested?)
+
 (defn stop!
   "Initiates supervisor shutdown.
 
@@ -420,7 +445,7 @@
 (def ^{:arglists '([opts])} make-reference-policy
   "Builds a pure reference policy `(fn [event state] -> {:directives :state})`,
    closing over `opts`. Recognized opts (others ignored):
-     :classify-error      (fn [error] -> :fatal | :rate-limited | :transient)
+     :classify-error      (fn [error] -> :abort | :rate-limited | :transient)
      :backoff-fn          (fn [attempts] -> backoff-ms) for transient retries
      :max-attempts        default max attempts when a task's context omits
                           :dj.concurrency/max-attempts (default 3)
