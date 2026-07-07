@@ -185,6 +185,15 @@
 ;; =============================================================================
 ;; 5. The reference co-supervisor (Phase-2 deliverable, §12.2)
 ;; =============================================================================
+;; HISTORICAL ORIGIN (RI 12). This is where the co-supervisor idea was born,
+;; BEFORE the concurrency bound existed — which is why it serializes by hand
+;; (`while (not idle?)`) and pokes the demo backend's private meter
+;; (`backend-load`). Both were workarounds for a missing library admission gate.
+;; RI 33 shipped that gate (`:pool-caps` + one `scan-deadlines` chokepoint), so
+;; the RI-34/35 GRADUATED reference does neither — it settle-detects from task
+;; status alone and leans on the cap for pacing. For real use, copy that one:
+;;   dev/dj/concurrency/reference_co_supervisor.clj
+;; Keep this as a point-in-time record of the lineage.
 ;; Does NOT trust the lossy tap as a work queue. It RECONCILES against
 ;; (c/parked-tasks) — authoritative state, never lossy — and SERVICES parks
 ;; SERIALLY (single-flight): wait for the worker to drain, grant one clean retry,

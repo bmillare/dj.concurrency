@@ -430,6 +430,40 @@ Scope: `:parked` only — the set that will otherwise block `deref` forever.
 fuller picture use `tasks-by-status`. `explain-stuck` doesn't push or notify — if you
 never call it you learn nothing; that half is the tap's job.
 
+### A reference co-supervisor you can copy (`dev/`)
+
+The snippet above is the *shape*; a complete, tested implementation lives at
+[`dev/dj/concurrency/reference_co_supervisor.clj`](dev/dj/concurrency/reference_co_supervisor.clj).
+It is deliberately **not public API** — a copy-paste-quality starting point you lift
+into your own code and adapt. It reconciles off `explain-stuck`, keeps a per-task retry
+**budget** with a pluggable `:on-exhausted` escalation, optionally scopes to a `:pool`
+for per-pool recovery, and reaches into **zero** backend internals (it settle-detects
+from task status alone).
+
+```clojure
+(require '[dj.concurrency.reference-co-supervisor :as co])
+
+;; recommended: cap the pool, then a naive reconcile+retry loop
+(def sup  (c/create-supervisor {:pool-caps {:llm 4}}))
+(def stop (co/start-co-supervisor sup {:pool :llm :budget 3}))
+;; … later …
+(stop)
+```
+
+**The cap-or-serialize contract.** Recovery retries can themselves stampede a slow
+backend — the thundering herd, reborn at the recovery layer. Something must pace them,
+and *either one alone* suffices:
+
+- **Cap the pool** (`:pool-caps`) and the co-sup can be **naive** (the default): a
+  co-sup `retry` re-enters the same admission gate as every other attempt, so it can't
+  out-run the cap. Pacing is one number — this is the recommended recipe.
+- **Or serialize** (`:serialize? true`) for an **unbounded** pool — service one park at
+  a time. Needed only when the pool has no cap.
+
+Don't do both; serialization under a cap is redundant. This keeps *prevention* (the
+cap) and *recovery* (the co-sup) separate on purpose: the cap bounds load up front, the
+co-sup mops up genuine failures — it is not the thing that paces load.
+
 ---
 
 ## Customizing policy
@@ -528,7 +562,10 @@ clojure -M:repl        # dev REPL (adds dev/ and test/ to the path)
 The test suite has two layers: **pure policy tests** drive `default-policy` directly
 with an explicit `:now` (deterministic, no threads), and **integration tests**
 exercise a live supervisor with real virtual threads for the happy path and the
-REPL-driven recovery workflow.
+REPL-driven recovery workflow. The `:test` alias also puts `dev/` on the classpath so
+the suite can exercise the reference co-supervisor
+([`dev/dj/concurrency/reference_co_supervisor.clj`](dev/dj/concurrency/reference_co_supervisor.clj),
+tested in `test/dj/concurrency/reference_co_supervisor_test.clj`).
 
 There's also a runnable interactive demo:
 

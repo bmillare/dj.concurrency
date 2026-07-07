@@ -214,7 +214,7 @@ The [in-depth guide (`README_AGENTS.md`)](README_AGENTS.md) covers the rest — 
 - **[Bounding concurrency to a slow backend](README_AGENTS.md#bounding-concurrency-to-a-slow-backend-recipe)** — a one-semaphore recipe for when the backend can only serve a few requests at once (a different axis from retry/throttle).
 - **[Durable results / crash recovery](README_AGENTS.md#durable-results--crash-recovery)** — an opt-in, crash-safe memo table: after a crash, re-run the same workflow and completed work resolves instantly from a journal instead of re-executing (e.g. no re-paying for 49 of 50 LLM calls).
 - **[Logging & the event tap](README_AGENTS.md#logging--the-event-tap)** + the **[full event vocabulary](README_AGENTS.md#the-event-vocabulary-full-reference)** — how lifecycle transitions reach you, and every event the supervisor emits.
-- **[Reacting to events (co-supervision)](README_AGENTS.md#reacting-to-events-co-supervision)** — driving retries/aborts programmatically with a poll+tap pattern.
+- **[Reacting to events (co-supervision)](README_AGENTS.md#reacting-to-events-co-supervision)** — driving retries/aborts programmatically with a poll+tap pattern, plus a tested, copy-paste [`dev/` reference co-supervisor](dev/dj/concurrency/reference_co_supervisor.clj).
 - **[Customizing policy](README_AGENTS.md#customizing-policy)** — `:classify-error`, backoff, and writing your own state machine.
 - **[Architecture](README_AGENTS.md#architecture-functional-core--imperative-shell)**, **[task lifecycle & statuses](README_AGENTS.md#task-lifecycle--statuses)**, the **[API reference](README_AGENTS.md#api-reference)**, and **[developing on this repo](README_AGENTS.md#developing-on-this-repo)**.
 

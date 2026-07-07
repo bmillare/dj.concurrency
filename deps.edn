@@ -16,7 +16,9 @@
           :main-opts ["-m" "nrepl.cmdline"]}
 
   ;; Run the test suite (dev-only deps): clojure -X:test
-  :test {:extra-paths ["test"]
+  ;; `dev` is on the path so the suite can exercise the reference co-supervisor
+  ;; (dev/, a copy-paste reference — not shipped API, but tested).
+  :test {:extra-paths ["test" "dev"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
          :exec-fn cognitect.test-runner.api/test}
