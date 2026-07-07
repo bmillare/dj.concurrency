@@ -186,9 +186,9 @@ When you write your worker function, you don't write retry logic. Instead, you j
 ```
 
 The supervisor's default policy looks at the keys in your `ex-data`:
-- If it sees `{:type :business-error}`, it aborts immediately and **parks** the task for you to inspect.
-- If it sees `{:status 429}`, it **throttles** the entire supervisor (pausing all other requests for the duration of `:retry-after`).
-- If it sees anything else, it assumes a transient error and **retries** up to the max attempt limit (default is 3), and then parks.
+- If it sees `{:type :business-error}`, it treats the failure as **fatal** and **aborts** the task. Abort is terminal — `@f` re-throws the error — so this is the escape hatch for a failure that's *never worth fixing* (or that your calling code wants to catch on `deref`). It is **not** the same as parking, and an aborted task can't be retried; see [park vs. abort](README_AGENTS.md#park-vs-abort).
+- If it sees `{:status 429}`, it **throttles** that request's pool (queuing the pool's other requests for the duration of `:retry-after`; with a single default pool that's every request).
+- If it sees anything else, it assumes a transient error and **retries** up to the max attempt limit (default is 3), and then **parks** the task for you to inspect and fix forward.
 
 You can customize this entirely. If you want to trigger special behavior (like falling back to a cheaper model, or refreshing an auth token), just have your function throw a specific key in `ex-info` and configure the supervisor to look for it (see [Customizing policy](README_AGENTS.md#customizing-policy)).
 

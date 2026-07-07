@@ -146,6 +146,30 @@ Every task carries a `:status`. The poll surface (`tasks`, `task`, `parked-tasks
 The three terminal statuses (`:resolved :aborted :cancelled`) are the set
 `dj.concurrency.policy/terminal-statuses`: safe to prune, safe to drop the future.
 
+### Park vs. abort
+
+Recover vs. give up — the distinction the whole workflow turns on:
+
+- **`:parked` is the recoverable state.** A retryable error exhausted its attempts, so the
+  task is *paused, inspectable, and resumable* — non-terminal, waiting for you (or a
+  co-supervisor) to fix forward and `retry`. This is the state the [fix-forward
+  loop](#the-intended-workflow-develop-at-the-repl-fix-forward) is built on.
+- **`:aborted` is the give-up state.** Terminal: `@f` re-throws, and the task **cannot be
+  retried** back to life. It's the escape hatch for a failure that's never worth fixing —
+  or one your calling code deliberately wants to catch on `deref`.
+
+A task reaches `:aborted` three ways, none of them a normal retry outcome:
+
+1. **A `:fatal` classification** — your `:classify-error` decides "don't retry this" (the
+   default maps `{:type :business-error}`; see [Customizing policy](#customizing-policy)).
+2. **A REPL / co-supervisor `abort`** — you decide to give up on a parked task.
+3. **`stop!` in the default `:abort-pending` mode** — shutdown aborts every non-terminal
+   task, parked ones included (use `(stop! sup :drop)` to skip that).
+
+A worker exception *by itself* never aborts: it retries and then **parks**. Only a
+`:fatal` verdict turns a failure terminal. So in a fix-forward run you almost always want
+failures to park — reach for abort only when you truly mean "stop, this one is done."
+
 Task-map fields you can read from `(task f)` / `(tasks sup)`:
 `:task-id :status :context :closure :submitted-at :wake-at :throttle?
 :admission-waiting? :error :cached?`.
@@ -561,16 +585,20 @@ like `:backoff-fn`, `:max-attempts`, `:classify-error`, or `:default-throttle-ms
    :backoff-fn  (fn [attempts] (* 250 attempts))          ; 250ms linear backoff
    :classify-error (fn [error]                            ; :fatal | :rate-limited | :transient
                      (cond
-                       (= :auth (:type (ex-data error))) :fatal
+                       ;; permanently invalid input — never worth a retry; let @f throw
+                       (= :invalid-input (:type (ex-data error))) :fatal
                        :else :transient))})
 ```
 
-`:classify-error` is the main extension point: return `:fatal` (abort + park now),
-`:rate-limited` (throttle the whole supervisor), or `:transient` (retry with backoff).
-This is how you trigger special behavior — e.g. classify an auth error as `:fatal` so
-it parks immediately for you to refresh a token, or treat a specific status as
-rate-limited. Per-task overrides go in the context map under the `:dj.concurrency/`
-namespace (e.g. `:dj.concurrency/max-attempts`).
+`:classify-error` is the main extension point: return `:transient` (retry with backoff,
+then park), `:rate-limited` (throttle that pool and retry when the window lifts), or
+`:fatal` (**abort** — terminal, no retry, no park; `@f` re-throws). Reach for `:fatal`
+only as an escape hatch: a failure that's never worth fixing forward, or one your calling
+code is waiting to catch on `deref`. Anything you'd *fix and retry* — a stale token, a
+code bug, a bad prompt — should **park** instead (the default `:transient` path), so you
+can fix forward and `retry`; see [park vs. abort](#park-vs-abort). Per-task overrides go
+in the context map under the `:dj.concurrency/` namespace (e.g.
+`:dj.concurrency/max-attempts`).
 
 If you *do* need total control, write your own state transition function and pass it
 as `:policy`. Read `default-policy` and `make-reference-policy` (re-exported from
