@@ -17,6 +17,19 @@
 ;; The three statuses a task can never leave: safe to prune, safe to drop the CF.
 (def terminal-statuses #{:resolved :aborted :cancelled})
 
+;; State sentinel: a pool that is REGISTERED but carries no concurrency cap.
+;; Distinct from "absent" so a first-seen (undeclared) pool can be told apart
+;; from a declared-unbounded one — that distinction is what makes the
+;; :unknown-pool warn fire exactly once. Keyed to the dj.concurrency namespace.
+(def ^:private pool-unbounded :dj.concurrency/unbounded)
+
+(defn- task-pool
+  "The resource pool a task is bound to: an opaque `:dj.concurrency/pool` context
+   tag (1:1 with an external resource, or an API-key/tenant/rate-limit bucket —
+   the policy never interprets it). Untagged tasks fall into :default."
+  [t]
+  (get-in t [:context :dj.concurrency/pool] :default))
+
 (defn default-classify-error
   "Reference heuristic for classifying errors based on the dispatch table examples.
    In a production system, supply your own via `make-reference-policy`."
@@ -34,19 +47,20 @@
 
 (def default-reference-opts
   "Defaults for the reference policy. Override any via `make-reference-policy`
-   (or by passing them to `create-supervisor`)."
+   (or by passing them to `create-supervisor`).
+
+   Per-pool concurrency caps are deliberately NOT here: they are runtime-updatable
+   and so live in supervisor STATE (`:pool-caps {pool cap}`, seeded by
+   `create-supervisor` from its `:pool-caps` opt and written live by
+   `set-pool-cap!`), not in this frozen config closure. A cap is either a positive
+   integer or the `:dj.concurrency/unbounded` sentinel; in-flight is bounded PER
+   POOL at the single admission chokepoint (`scan-deadlines`), a permit == a
+   :running slot. No `:pool-caps` ⇒ one unbounded :default pool ⇒ today's exact
+   behavior. See the multi-resource design doc."
   {:classify-error      default-classify-error
    :backoff-fn          default-backoff
    :max-attempts        3
-   :default-throttle-ms 5000
-   ;; Concurrency admission (RI 16 / approach A2). nil = unbounded (today's exact
-   ;; behavior; every path below is inert). When set to W, the policy bounds
-   ;; concurrent :running tasks to W: a permit == a :running slot, so a task that
-   ;; leaves :running (park, backoff, terminal) frees it, and every worker-bound
-   ;; path (submit, timed retry, repl/co-sup retry) re-acquires through the SINGLE
-   ;; chokepoint below (scan-deadlines). This is the concurrency-axis twin of the
-   ;; time-axis throttle. See ledger/concurrency_limit_approaches_2026_07_06.md.
-   :max-in-flight       nil})
+   :default-throttle-ms 5000})
 
 ;; Event transition logic
 (defn- apply-event
@@ -68,36 +82,31 @@
                                :error (ex-info "supervisor stopped" {:type :dj.concurrency/shutdown})}]]
          :state state}
 
-        (let [throttled? (and (:throttle-expires-at state)
-                              (< now (:throttle-expires-at state)))]
-          (if throttled?
-            ;; S2: Throttled
-            {:directives [[:log {:level :info :event :submit-throttled :task-id task-id :data task-id}]]
-             :state (assoc-in state [:tasks task-id]
-                              {:task-id task-id, :status :queued
-                               ;; Seed ::attempts like S3 so a later failure never
-                               ;; increments a missing counter.
-                               :context (assoc (:context payload) :dj.concurrency/attempts 1)
-                               :closure (:closure payload)
-                               :submitted-at (:submitted-at payload)})}
-            ;; S3: Normal Submit
-            (let [ctx' (assoc (:context payload) :dj.concurrency/attempts 1)]
-              (if (:max-in-flight config)
-                ;; S3b: Bounded — enter the admission queue (like the throttled S2
-                ;; path, but on the concurrency axis). scan-deadlines admits it
-                ;; the moment a permit is free (often the same pass).
-                {:directives [[:log {:level :debug :event :submit-queued :task-id task-id :data task-id}]]
-                 :state (assoc-in state [:tasks task-id]
-                                  {:task-id task-id, :status :queued
-                                   :context ctx', :closure (:closure payload)
-                                   :submitted-at (:submitted-at payload)})}
-                ;; S3a: Unbounded — unchanged direct dispatch.
-                {:directives [[:execute {:task-id task-id :context ctx' :closure (:closure payload)}]
-                              [:log {:level :debug :event :submit-executed :task-id task-id :data task-id}]]
-                 :state (assoc-in state [:tasks task-id]
-                                  {:task-id task-id, :status :running
-                                   :context ctx', :closure (:closure payload)
-                                   :submitted-at (:submitted-at payload)})})))))
+        ;; S2: Always enqueue. scan-deadlines is the SINGLE per-pool admission
+        ;; chokepoint; it admits this task the same pass when the task's pool has a
+        ;; free permit (an unbounded pool always does). Collapsing the old
+        ;; bounded/unbounded + throttled submit forks into one queue path is what
+        ;; funnels every worker-bound route through one gate — per pool (F11).
+        ;; ::attempts is seeded to 1 so a later failure never increments a missing
+        ;; counter.
+        (let [ctx'   (assoc (:context payload) :dj.concurrency/attempts 1)
+              pool   (get ctx' :dj.concurrency/pool :default)
+              known? (contains? (:pool-caps state) pool)]
+          {:directives (cond-> [[:log {:level :debug :event :submit-queued :task-id task-id
+                                       :data {:task-id task-id :pool pool}}]]
+                         ;; U-lifecycle "middle": a submit to a pool with no declared
+                         ;; cap runs UNBOUNDED but warns ONCE — a typo'd tag is loud
+                         ;; instead of silently escaping its intended bound.
+                         (not known?)
+                         (conj [:log {:level :warn :event :unknown-pool :task-id task-id
+                                      :data {:task-id task-id :pool pool}}]))
+           :state (cond-> (assoc-in state [:tasks task-id]
+                                    {:task-id task-id, :status :queued
+                                     :context ctx', :closure (:closure payload)
+                                     :submitted-at (:submitted-at payload)})
+                    ;; Register the pool so the warn never re-fires and `state`
+                    ;; lists every pool ever touched (one authoritative registry).
+                    (not known?) (assoc-in [:pool-caps pool] pool-unbounded))}))
 
       ;; --- K: Success ---
       :success
@@ -128,7 +137,8 @@
         {:directives [[:log {:level :warn :event :late-failure :task-id task-id :data task-id}]] :state state}
 
         (= :running status)
-        (let [err-type     ((:classify-error config) (:error payload))
+        (let [pool         (task-pool t)
+              err-type     ((:classify-error config) (:error payload))
               attempts     (get-in t [:context :dj.concurrency/attempts] 1)
               max-attempts (get-in t [:context :dj.concurrency/max-attempts] (:max-attempts config))]
           (case err-type
@@ -141,18 +151,19 @@
             :rate-limited
             (let [window  (or (:retry-after (ex-data (:error payload))) (:default-throttle-ms config))
                   wake-at (+ now window)]
-              ;; Emit a first-class :throttle-wait event: a 429 pauses the WHOLE
-              ;; supervisor, so it is supervisor-level notable (:info), not a
-              ;; routine per-task step. Previously this branch was SILENT, which
-              ;; hid the throttle from the tap (see playground finding F1).
+              ;; Emit a first-class :throttle-wait event carrying :pool: a 429
+              ;; pauses only THIS pool (per-pool throttle), so a saturated backend
+              ;; can't false-couple the others. Previously this branch was SILENT,
+              ;; which hid the throttle from the tap (playground finding F1).
               {:directives [[:log {:level :info :event :throttle-wait :task-id task-id
-                                   :data {:task-id task-id :wake-in-ms window}}]]
-               ;; A concurrent, shorter 429 must not shorten a live window, so
-               ;; keep the later expiry. A 429 doesn't consume the retry budget
-               ;; (being throttled isn't evidence the task is broken). :throttle?
-               ;; tags the waiter so clear-throttle can wake exactly these tasks.
+                                   :data {:task-id task-id :pool pool :wake-in-ms window}}]]
+               ;; PER-POOL window (replaces the global scalar): a concurrent,
+               ;; shorter 429 must not shorten a live window, so keep the later
+               ;; expiry. A 429 doesn't consume the retry budget (being throttled
+               ;; isn't evidence the task is broken). :throttle? tags the waiter so
+               ;; clear-throttle can wake exactly these tasks.
                :state (-> state
-                          (update :throttle-expires-at (fnil max 0) wake-at)
+                          (update-in [:pool-throttle pool] (fnil max 0) wake-at)
                           (update-in [:tasks task-id] assoc
                                      :status :waiting-retry :wake-at wake-at
                                      :throttle? true :error (:error payload)))})
@@ -192,21 +203,16 @@
       :repl/retry
       (cond
         ;; R1 — a REPL retry grants a fresh attempt budget ("I changed something").
+        ;; Route to :queued so the retry re-acquires through its POOL's gate at
+        ;; scan-deadlines (F11 per pool: the pool tag rides on :context, so a
+        ;; co-sup/REPL retry never re-enters uncounted or in the wrong pool — the
+        ;; F10 :on-park leak). One chokepoint means no bounded/unbounded fork here.
         (#{:parked :waiting-retry :queued} status)
-        (let [t' (assoc-in t [:context :dj.concurrency/attempts] 1)]
-          (if (:max-in-flight config)
-            ;; R1b: Bounded — a co-sup/REPL retry MUST re-acquire through the same
-            ;; admission chokepoint, or it re-enters uncounted and LEAKS the bound
-            ;; (RC-2/F11, the F10 :on-park leak). So route to :queued; scan admits.
-            {:directives [[:log {:level :debug :event :retry-queued :task-id task-id :data task-id}]]
-             :state (update-in state [:tasks task-id] assoc
-                               :status :queued :wake-at nil :throttle? nil
-                               :context (:context t'))}
-            ;; R1a: Unbounded — unchanged direct dispatch.
-            {:directives [[:execute (select-keys t' [:task-id :context :closure])]]
-             :state (update-in state [:tasks task-id] assoc
-                               :status :running :wake-at nil :throttle? nil
-                               :context (:context t'))}))
+        {:directives [[:log {:level :debug :event :retry-queued :task-id task-id
+                             :data {:task-id task-id :pool (task-pool t)}}]]
+         :state (update-in state [:tasks task-id] assoc
+                           :status :queued :wake-at nil :throttle? nil
+                           :context (assoc-in (:context t) [:dj.concurrency/attempts] 1))}
         ;; R2 & R3
         (= :running status)
         {:directives [[:log {:level :warn :event :already-running :task-id task-id :data task-id}]] :state state}
@@ -245,22 +251,35 @@
         {:directives [[:log {:level :warn :event :invalid-cancel :task-id task-id :data task-id}]] :state state})
 
       ;; --- X: REPL Clear Throttle ---
-      ;; Lift the window and mark throttle-tagged waiters due, so the
-      ;; scan-deadlines post-step drains both the queued tasks and the 429'd task
-      ;; in this same pass.
+      ;; Lift a pool's throttle window (or ALL pools' when :pool is absent) and
+      ;; mark that pool's throttle-tagged waiters due, so the scan-deadlines
+      ;; post-step drains both the queued tasks and the 429'd task in this pass.
       :repl/clear-throttle
-      {:directives []
-       :state (-> state
-                  (assoc :throttle-expires-at nil)
-                  (update :tasks
-                          (fn [ts]
-                            (into {}
-                                  (map (fn [[id t]]
-                                         [id (if (and (= :waiting-retry (:status t))
-                                                      (:throttle? t))
-                                               (assoc t :wake-at now)
-                                               t)]))
-                                  ts))))}
+      (let [pool (:pool payload)]                 ;; nil => clear every pool
+        {:directives []
+         :state (-> state
+                    (update :pool-throttle (fn [pt] (if pool (dissoc pt pool) {})))
+                    (update :tasks
+                            (fn [ts]
+                              (into {}
+                                    (map (fn [[id t]]
+                                           [id (if (and (= :waiting-retry (:status t))
+                                                        (:throttle? t)
+                                                        (or (nil? pool) (= pool (task-pool t))))
+                                                 (assoc t :wake-at now)
+                                                 t)]))
+                                    ts))))})
+
+      ;; --- SC: REPL Set Pool Cap ---
+      ;; Runtime-updatable per-pool concurrency bound. Writes the cap into STATE
+      ;; (not a frozen config closure), so an operator can retune a live pool —
+      ;; and a future signal-learned bound (U8) would write the same slot. Lowering
+      ;; below current in-flight is safe: scan just admits 0 until the pool drains
+      ;; below the new cap; no running task is touched.
+      :repl/set-pool-cap
+      {:directives [[:log {:level :info :event :pool-cap-set
+                           :data {:pool (:pool payload) :cap (:cap payload)}}]]
+       :state (assoc-in state [:pool-caps (:pool payload)] (:cap payload))}
 
       ;; --- P: REPL Prune ---
       ;; The payload has no :task-id, so task-id/t/status above are nil here —
@@ -296,83 +315,94 @@
       {:directives [[:log {:level :error :event :unknown-event :data event-type}]] :state state})))
 
 (defn- scan-deadlines
-  "Runs after every event (including ticks). Checks the clock against state
-   deadlines and drains tasks accordingly.
+  "Runs after every event (including ticks): the PER-POOL admission chokepoint +
+   deadline drain. Takes and returns a {:directives [...] :state {...}} map.
    Corresponds to rows T-a, T-b, and T-c in the spec.
-   Takes and returns a {:directives [...] :state {...}} map.
 
-   THE ADMISSION CHOKEPOINT (RI 16 / A2): when `config` carries :max-in-flight W,
-   this is the single place a task is admitted to a worker. Every worker-bound
-   path funnels here (submit and repl-retry route to :queued when bounded; timed
-   retries already do), so bounding admissions to the free-permit budget bounds
-   ALL of them from one point — satisfying F11 by construction. A permit == a
-   :running slot; in-flight is just the count of :running tasks, so a park/backoff/
-   terminal transition frees a permit with no bookkeeping."
-  [{:keys [directives state]} config now]
-  (let [;; 1. Remove throttle if naturally expired
-        throttle-at (:throttle-expires-at state)
-        state-1     (if (and throttle-at (<= throttle-at now))
-                      (assoc state :throttle-expires-at nil)
-                      state)
+   For EACH pool independently: expire its throttle window if due; count its
+   in-flight (:running) tasks; drain its eligible set (queued + due-retry)
+   oldest-first (FIFO, U4) up to the free-permit budget (W_r − in-flight). A pool
+   whose cap is unbounded (or as-yet unregistered) drains fully; a throttled pool
+   admits nothing. No cross-pool coordination — a saturated or 429'd pool never
+   holds up another.
 
-        ;; 2. Determine if we are currently throttled
-        throttled?  (boolean (:throttle-expires-at state-1))
+   THE CHOKEPOINT (RI 16 / A2, generalized per pool): every worker-bound path
+   (submit, timed retry, repl/co-sup retry) routes to :queued, so bounding
+   admissions here bounds ALL of them from one point — F11, per pool. A permit ==
+   a :running slot; in-flight is just the per-pool count of :running tasks, so a
+   park/backoff/terminal transition frees a permit with no bookkeeping. Admission
+   observability (:admission-granted / :admission-wait, both carrying :pool) fires
+   only for CAPPED pools, so an unbounded pool drains as silently as today's
+   unbounded supervisor."
+  [{:keys [directives state]} _config now]
+  (let [pool-caps  (:pool-caps state)
+        ;; 1. Expire per-pool throttle windows whose deadline has passed.
+        pt'        (into {} (remove (fn [[_ at]] (<= at now)) (:pool-throttle state)))
+        state-1    (assoc state :pool-throttle pt')
+        throttled? (fn [pool] (contains? pt' pool))
+        all        (vals (:tasks state-1))
 
-        ;; 3. Find due tasks (T-a & T-b)
-        ;; If we are unthrottled, we drain BOTH queued tasks (T-a / REPL clears)
-        ;; AND any retries whose wake-at has arrived (T-b).
-        eligible (if throttled?
-                   []
-                   (->> (:tasks state-1)
-                        vals
-                        (filter (fn [t]
+        ;; 2. In-flight per pool = count of :running tasks by pool tag.
+        running-by-pool (frequencies (map task-pool (filter #(= :running (:status %)) all)))
+
+        ;; 3. Eligible (T-a queued / REPL clears + T-b due retries), EXCLUDING any
+        ;; task whose pool is currently throttled.
+        eligible   (filter (fn [t]
+                             (and (not (throttled? (task-pool t)))
                                   (or (= :queued (:status t))
                                       (and (= :waiting-retry (:status t))
-                                           (:wake-at t)
-                                           (<= (:wake-at t) now)))))))
+                                           (:wake-at t) (<= (:wake-at t) now)))))
+                           all)
 
-        ;; 3b. Concurrency admission (A2): cap the drain to the free-permit budget.
-        ;; Unbounded (W nil) → admit everyone (unchanged). Bounded → admit oldest
-        ;; first (roughly FIFO) up to (W - in-flight); the rest wait for a permit.
-        W          (:max-in-flight config)
-        in-flight  (when W (->> (:tasks state-1) vals
-                                (filter #(= :running (:status %))) count))
-        budget     (when W (max 0 (- W in-flight)))
-        eligible*  (if W (sort-by :submitted-at eligible) eligible)
-        tasks-to-run (if W (take budget eligible*) eligible*)
-        blocked      (if W (drop budget eligible*) [])
+        ;; 4. Group by pool; drain each independently, oldest-first up to its
+        ;; free-permit budget. Unbounded/unregistered pool ⇒ full drain.
+        by-pool    (into {} (map (fn [[p ts]] [p (sort-by :submitted-at ts)]))
+                         (group-by task-pool eligible))
+        drain      (reduce
+                    (fn [acc [pool ts]]
+                      (let [cap    (get pool-caps pool)
+                            capped (number? cap)
+                            inflt  (get running-by-pool pool 0)
+                            budget (if capped (max 0 (- cap inflt)) (count ts))]
+                        (-> acc
+                            (update :admit into (take budget ts))
+                            (update :block into (drop budget ts))
+                            (assoc-in [:capped pool] capped)
+                            (assoc-in [:inflt pool] inflt)
+                            (assoc-in [:cap pool] cap))))
+                    {:admit [] :block [] :capped {} :inflt {} :cap {}}
+                    by-pool)
+        admit      (:admit drain)
+        blocked    (:block drain)
 
-        ;; 4. Generate execute directives (+ admission observability under a bound)
-        exec-dirs (map (fn [t] [:execute (select-keys t [:task-id :context :closure])])
-                       tasks-to-run)
-        grant-logs (when W
-                     (map-indexed
-                      (fn [i t] [:log {:level :debug :event :admission-granted :task-id (:task-id t)
-                                       :data {:task-id       (:task-id t)
-                                              :in-flight      (+ in-flight i 1)
-                                              :max-in-flight  W}}])
-                      tasks-to-run))
+        ;; 5. Execute directives (+ admission observability, capped pools only).
+        exec-dirs  (map (fn [t] [:execute (select-keys t [:task-id :context :closure])]) admit)
+        grant-logs (for [t admit
+                         :let  [p (task-pool t)]
+                         :when (get-in drain [:capped p])]
+                     [:log {:level :debug :event :admission-granted :task-id (:task-id t)
+                            :data {:task-id (:task-id t) :pool p
+                                   :in-flight (get-in drain [:inflt p]) :cap (get-in drain [:cap p])}}])
         ;; :admission-wait fires ONCE per task (only when newly blocked), the twin
-        ;; of :throttle-wait — so a saturated bound is legible without per-event spam.
-        wait-logs (when W
-                    (for [t blocked
-                          :when (not (:admission-waiting? t))]
-                      [:log {:level :info :event :admission-wait :task-id (:task-id t)
-                             :data {:task-id       (:task-id t)
-                                    :in-flight     in-flight
-                                    :max-in-flight W}}]))
+        ;; of :throttle-wait — so a saturated pool is legible without per-event spam.
+        wait-logs  (for [t blocked
+                         :let  [p (task-pool t)]
+                         :when (and (get-in drain [:capped p]) (not (:admission-waiting? t)))]
+                     [:log {:level :info :event :admission-wait :task-id (:task-id t)
+                            :data {:task-id (:task-id t) :pool p
+                                   :in-flight (get-in drain [:inflt p]) :cap (get-in drain [:cap p])}}])
 
-        ;; 5. Advance admitted tasks to :running (clear :throttle?/:admission-waiting?);
+        ;; 6. Advance admitted tasks to :running (clear :throttle?/:admission-waiting?);
         ;; tag newly-blocked tasks so the wait event doesn't re-fire next pass.
-        state-2  (as-> state-1 s
-                   (reduce (fn [s t]
-                             (update-in s [:tasks (:task-id t)]
-                                        assoc :status :running :wake-at nil
-                                        :throttle? nil :admission-waiting? nil))
-                           s tasks-to-run)
-                   (reduce (fn [s t]
-                             (assoc-in s [:tasks (:task-id t) :admission-waiting?] true))
-                           s blocked))]
+        state-2    (as-> state-1 s
+                     (reduce (fn [s t]
+                               (update-in s [:tasks (:task-id t)]
+                                          assoc :status :running :wake-at nil
+                                          :throttle? nil :admission-waiting? nil))
+                             s admit)
+                     (reduce (fn [s t]
+                               (assoc-in s [:tasks (:task-id t) :admission-waiting?] true))
+                             s blocked))]
 
     ;; T-c (expiry/TTL logic) is reserved for v2.
     {:directives (into [] (concat directives grant-logs wait-logs exec-dirs))
@@ -387,9 +417,8 @@
      :max-attempts        default max attempts when a task's context omits
                           :dj.concurrency/max-attempts (default 3)
      :default-throttle-ms throttle window for a 429 with no :retry-after (ms)
-     :max-in-flight       optional concurrency bound W (nil = unbounded, default).
-                          When set, at most W tasks are :running at once; excess
-                          submits/retries queue and are admitted as permits free.
+   Per-pool concurrency caps are NOT a policy opt — they live in supervisor state
+   (`:pool-caps`, seeded by `create-supervisor`, updatable via `set-pool-cap!`).
    See `default-reference-opts`.
 
    This is how supervisor-level configuration threads into the (otherwise pure,
@@ -399,8 +428,7 @@
   [opts]
   (let [config (merge default-reference-opts
                       (select-keys opts [:classify-error :backoff-fn
-                                         :max-attempts :default-throttle-ms
-                                         :max-in-flight]))]
+                                         :max-attempts :default-throttle-ms]))]
     (fn reference-policy [event state]
       (let [;; Fallback to current time only for test/REPL ergonomics. During
             ;; real usage the impure shell stamps :now onto every event.

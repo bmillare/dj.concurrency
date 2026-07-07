@@ -139,12 +139,30 @@ Three things make or break this recipe:
   co-supervisor that services parks — the concurrency bound (prevention) and
   park-recovery (cure) compose cleanly.
 
-> This is a documented recipe, not yet library surface. (There is experimental,
-> internal support for an admission bound via a `:max-in-flight` policy option — it
-> emits `:admission-wait`/`:admission-granted` events — but it is not yet a
-> committed public API.) If you find yourself needing one gate shared across many
-> call sites or supervisors, that's the signal it should become a first-class
-> per-backend concurrency limit — tell us about your workload.
+> **Or let the supervisor do it — `:pool-caps` (shipped).** The bound above is a
+> property of the *backend*, so the library can hold it for you, per resource, inside
+> one supervisor. Declare per-pool caps and tag each submit with its pool:
+>
+> ```clojure
+> (def sup (c/create-supervisor {:pool-caps {:llm-a 4, :llm-b 2}}))
+>
+> ;; the caller names the endpoint; the supervisor enforces its cap
+> (c/submit sup {:dj.concurrency/pool :llm-a} #(call-llm-a …))
+> (c/submit sup {:dj.concurrency/pool :llm-b} #(call-llm-b …))
+>
+> (c/set-pool-cap! sup :llm-a 8)   ; retune a bound live
+> ```
+>
+> Each pool is admitted **and** 429-throttled independently — a saturated or
+> rate-limited backend never stalls another. A permit == a `:running` slot, so a
+> parked/backed-off task frees it automatically (no wedged permit to babysit, unlike
+> the semaphore above). Untagged work uses an unbounded `:default` pool; a submit to a
+> pool with no declared cap runs unbounded and warns once (`:unknown-pool`). Omit
+> `:pool-caps` entirely and behavior is exactly as before. Caps live in supervisor
+> state and are retunable at runtime via `set-pool-cap!`. The consumer-side semaphore
+> above is still fine when you want the gate outside the supervisor; `:pool-caps` is
+> the same bound, first-class and observable (`:admission-wait`/`:admission-granted`
+> carry `:pool`).
 
 ---
 
@@ -283,16 +301,16 @@ top-level `:task-id`; the `:data` column shows the payload shape.
 
 | `:event` | `:level` | `:data` | task-scoped? | meaning |
 |---|---|---|:--:|---|
-| `:submit-executed` | `:debug` | task-id | ✓ | task handed to a worker thread (unbounded path) |
-| `:submit-queued` | `:debug` | task-id | ✓ | bounded path: submit entered the admission queue |
-| `:submit-throttled` | `:info` | task-id | ✓ | submit arrived during a throttle window; queued |
+| `:submit-queued` | `:debug` | `{:task-id :pool}` | ✓ | submit entered its pool's admission queue (the single chokepoint) |
+| `:unknown-pool` | `:warn` | `{:task-id :pool}` | ✓ | first submit to a pool with no declared cap; runs unbounded (warned once) |
 | `:retry-scheduled` | `:debug` | `{:task-id :attempt :max-attempts :wake-in-ms}` | ✓ | a transient failure will be retried after a backoff |
-| `:retry-queued` | `:debug` | task-id | ✓ | bounded path: a REPL/co-sup retry re-entered the admission queue |
-| `:throttle-wait` | `:info` | `{:task-id :wake-in-ms}` | ✓ | a 429 paused the **whole supervisor** for `:wake-in-ms` |
+| `:retry-queued` | `:debug` | `{:task-id :pool}` | ✓ | a REPL/co-sup retry re-entered its pool's admission queue |
+| `:throttle-wait` | `:info` | `{:task-id :pool :wake-in-ms}` | ✓ | a 429 paused **that pool** for `:wake-in-ms` (other pools run on) |
 | `:parked` | `:info` | task-id | ✓ | retries exhausted; the task awaits intervention |
 | `:cancelled` | `:info` | task-id | ✓ | task cancelled via `cancel` |
-| `:admission-granted` | `:debug` | `{:task-id :in-flight :max-in-flight}` | ✓ | (bounded) a permit freed; task admitted to a worker |
-| `:admission-wait` | `:info` | `{:task-id :in-flight :max-in-flight}` | ✓ | (bounded) no free permit; task waiting for admission |
+| `:admission-granted` | `:debug` | `{:task-id :pool :in-flight :cap}` | ✓ | (capped pool) a permit freed; task admitted to a worker |
+| `:admission-wait` | `:info` | `{:task-id :pool :in-flight :cap}` | ✓ | (capped pool) no free permit; task waiting for admission |
+| `:pool-cap-set` | `:info` | `{:pool :cap}` | — | a pool's concurrency bound was set/retuned via `set-pool-cap!` |
 | `:late-success` | `:warn` | task-id | ✓ | a `:success` for an already-terminal/unknown task (ignored) |
 | `:late-failure` | `:warn` | task-id | ✓ | a `:failed` for an already-terminal/unknown task (ignored) |
 | `:illegal-transition` | `:warn` | task-id | ✓ | success/failure arrived in an unexpected state |

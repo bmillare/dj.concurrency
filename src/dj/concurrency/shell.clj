@@ -49,18 +49,18 @@
    Returns milliseconds until that deadline, or Long/MAX_VALUE if none."
   [state now]
   ;; "at"s are unix timestamps (ts) since epoch
-  (let [wake-ats    (->> (:tasks state)
-                         vals
-                         ;; Only tasks actually waiting on a deadline count. A
-                         ;; terminal task that kept a stale :wake-at (from before
-                         ;; a REPL intervention) must NOT drive the poll timeout
-                         ;; to 0 forever -> 100% CPU spin.
-                         (filter #(= :waiting-retry (:status %)))
-                         (keep :wake-at)) ;; seq of ts
-        throttle-at (:throttle-expires-at state) ;; ts or nil
-        deadlines   (if throttle-at
-                      (conj wake-ats throttle-at)
-                      wake-ats)]
+  (let [wake-ats     (->> (:tasks state)
+                          vals
+                          ;; Only tasks actually waiting on a deadline count. A
+                          ;; terminal task that kept a stale :wake-at (from before
+                          ;; a REPL intervention) must NOT drive the poll timeout
+                          ;; to 0 forever -> 100% CPU spin.
+                          (filter #(= :waiting-retry (:status %)))
+                          (keep :wake-at)) ;; seq of ts
+        ;; Each pool has its own throttle window now; wake for the soonest so an
+        ;; expired per-pool throttle is drained on time, not on the next event.
+        throttle-ats (vals (:pool-throttle state)) ;; seq of ts
+        deadlines    (concat wake-ats throttle-ats)]
     (if (seq deadlines)
       (max 0 (- (apply min deadlines) now))
       Long/MAX_VALUE)))

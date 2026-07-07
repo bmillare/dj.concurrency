@@ -72,6 +72,16 @@
                  `(:task-id entry)` as the handle. The tap is LOSSY/best-effort:
                  build correctness on a poll+reconcile loop (see `tasks-by-status`
                  / `parked-tasks`) and use the tap only to react sooner.
+     :pool-caps - Optional `{pool cap}` map of per-pool concurrency bounds. A task
+                 declares its pool via a `:dj.concurrency/pool` context tag on
+                 `submit` (opaque — a backend, an API-key bucket, a tenant…);
+                 untagged tasks use `:default`. `cap` is a positive integer or
+                 `:dj.concurrency/unbounded`. Each pool is bounded and throttled
+                 INDEPENDENTLY (a 429 or saturation on one never stalls another).
+                 Caps live in state and are retunable live via `set-pool-cap!`. A
+                 submit to a pool with no declared cap runs unbounded and warns
+                 once (`:unknown-pool`). Omit entirely ⇒ every pool unbounded ⇒
+                 today's behavior.
      :store    - Optional dj.concurrency.store/ResultStore. When present, tasks
                  whose context contains :dj.concurrency/durable-key are memoized:
                  a prior recorded result short-circuits execution and resolves
@@ -87,9 +97,19 @@
    thread, shutdown-promise). Easily integrated into Component/Integrant."
   [opts]
   (let [q      (LinkedBlockingQueue.)
-        state  (atom {:tasks               {}
-                      :throttle-expires-at nil
-                      :shutdown?           false})
+        state  (atom {:tasks         {}
+                      ;; Per-pool concurrency caps live in STATE (updatable via
+                      ;; `set-pool-cap!`), seeded from the :pool-caps opt. :default
+                      ;; is pre-registered unbounded so untagged work never trips
+                      ;; the :unknown-pool warn; declare `:default` a number to
+                      ;; globally bound untagged tasks. No :pool-caps ⇒ all pools
+                      ;; unbounded ⇒ today's behavior exactly.
+                      :pool-caps     (merge {:default :dj.concurrency/unbounded}
+                                            (:pool-caps opts))
+                      ;; Per-pool 429 throttle windows (replaces a global scalar):
+                      ;; a 429 pauses only its own pool.
+                      :pool-throttle {}
+                      :shutdown?     false})
         policy (or (:policy opts) (policy/make-reference-policy opts))
         event-tap (:event-tap opts default-event-tap)
         sup    {:queue            q
@@ -213,7 +233,7 @@
    Returns `{:parked-count n :tasks [task ...]}` where each task is a flat,
    plain-value map
 
-     {:task-id :attempts :error <msg-string> :error-type :durable-key :age-ms}
+     {:task-id :pool :attempts :error <msg-string> :error-type :durable-key :age-ms}
 
    sorted oldest-first (largest `:age-ms`). Pure data: `pprint` it at a REPL, or
    filter/reconcile off `:tasks` in a co-supervisor, e.g.
@@ -235,6 +255,7 @@
                    (map (fn [[id t]]
                           (let [err (:error t)]
                             {:task-id     id
+                             :pool        (get-in t [:context :dj.concurrency/pool] :default)
                              :attempts    (get-in t [:context :dj.concurrency/attempts])
                              :error       (some-> err ex-message)
                              :error-type  (:type (ex-data err))
@@ -347,9 +368,33 @@
    :queued))
 
 (defn clear-throttle
-  "Manually lifts a supervisor-wide throttle window, draining the deferred queue."
-  [sup]
-  (.put ^BlockingQueue (:queue sup) [:repl/clear-throttle {}])
+  "Manually lifts a throttle window, draining that pool's deferred queue.
+
+   Arity-1 clears EVERY pool's window (the single-backend default); arity-2 clears
+   just `pool`. Throttle-tagged waiters in the cleared pool(s) are woken in the
+   same pass. Fire-and-forget; returns :queued."
+  ([sup]
+   (.put ^BlockingQueue (:queue sup) [:repl/clear-throttle {}])
+   :queued)
+  ([sup pool]
+   (.put ^BlockingQueue (:queue sup) [:repl/clear-throttle {:pool pool}])
+   :queued))
+
+(defn set-pool-cap!
+  "Sets (or retunes) a pool's concurrency bound at RUNTIME. `cap` is a positive
+   integer or `:dj.concurrency/unbounded` to lift the bound.
+
+     (set-pool-cap! sup :llm-a 8)                        ; retune live
+     (set-pool-cap! sup :llm-a :dj.concurrency/unbounded) ; lift the bound
+
+   The cap lives in supervisor state (not a frozen construction-time constant), so
+   this is a first-class live control — the operator's dial today, and the slot a
+   future signal-learned bound would write. Lowering the cap below the pool's
+   current in-flight is SAFE: admission simply stops (admits 0) until the pool
+   drains below the new cap; no running task is cancelled. Fire-and-forget;
+   returns :queued."
+  [sup pool cap]
+  (.put ^BlockingQueue (:queue sup) [:repl/set-pool-cap {:pool pool :cap cap}])
   :queued)
 
 (defn evict!

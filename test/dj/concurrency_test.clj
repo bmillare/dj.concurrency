@@ -21,7 +21,10 @@
 ;; =============================================================================
 
 (def ^:private base-state
-  {:tasks {} :throttle-expires-at nil :shutdown? false})
+  {:tasks {}
+   :pool-caps {:default :dj.concurrency/unbounded}
+   :pool-throttle {}
+   :shutdown? false})
 
 (defn- dir-types
   "Set of directive types in a directive vector."
@@ -32,6 +35,22 @@
   "First directive of the given type, or nil."
   [directives dir-type]
   (first (filter #(= dir-type (first %)) directives)))
+
+(defn- log-events
+  "Seq of :event keywords from the :log directives in a directive vector."
+  [directives]
+  (->> directives (filter #(= :log (first %))) (map (comp :event second))))
+
+(defn- run-events
+  "Threads a seq of events through `policy`, accumulating state. Returns the final
+   state map (for pure per-pool admission tests)."
+  [policy state events]
+  (reduce (fn [s ev] (:state (policy ev s))) state events))
+
+(defn- running-count
+  "How many of `tasks` (a seq of task maps) are :running."
+  [tasks]
+  (count (filter #(= :running (:status %)) tasks)))
 
 (defn- running-task
   "A task map already in :running state with the given context, for feeding
@@ -106,18 +125,19 @@
       (is (= :parked (get-in state' [:tasks "t1" :status]))))))
 
 (deftest rate-limited-throttles-supervisor
-  (testing "a 429 sets a supervisor-wide throttle window"
+  (testing "a 429 sets a per-pool throttle window (default pool when untagged)"
     (let [state (assoc-in base-state [:tasks "t1"] (running-task "t1" {::c/attempts 1}))
           {dirs :directives state' :state}
           (c/default-policy [:failed {:task-id "t1"
                                       :error (ex-info "rl" {:status 429 :retry-after 3000})
                                       :now 1000}] state)]
-      (is (= 4000 (:throttle-expires-at state')) "throttle = now + retry-after")
+      (is (= 4000 (get-in state' [:pool-throttle :default])) "throttle = now + retry-after, per pool")
       (is (= :waiting-retry (get-in state' [:tasks "t1" :status])))
-      ;; F1: the throttle is a first-class, supervisor-level event on the tap
+      ;; F1: the throttle is a first-class event on the tap, now carrying :pool
       (let [[_ log] (find-dir dirs :log)]
         (is (= :throttle-wait (:event log)) "emits :throttle-wait")
-        (is (= :info (:level log)) "supervisor-wide pause is :info, not :debug")
+        (is (= :info (:level log)) "a pool pause is :info, not :debug")
+        (is (= :default (get-in log [:data :pool])) ":pool identifies the throttled resource")
         (is (= 3000 (get-in log [:data :wake-in-ms])) ":wake-in-ms is the throttle window")))))
 
 (deftest entries-carry-top-level-task-id
@@ -206,8 +226,8 @@
       (is (= :aborted (get-in state' [:tasks "t1" :status]))))))
 
 (deftest submit-while-throttled-queues
-  (testing "submitting during a throttle window queues instead of executing"
-    (let [state (assoc base-state :throttle-expires-at 10000)
+  (testing "submitting into a throttled pool queues instead of executing"
+    (let [state (assoc base-state :pool-throttle {:default 10000})
           {dirs :directives state' :state}
           (c/default-policy [:submit {:task-id "t2" :context {} :closure (fn [] :ok)
                                       :submitted-at 0 :now 5000}] state)]
@@ -228,12 +248,12 @@
 (deftest clear-throttle-drains-queued
   (testing "clearing the throttle immediately drains queued tasks"
     (let [state (-> base-state
-                    (assoc :throttle-expires-at 10000)
+                    (assoc :pool-throttle {:default 10000})
                     (assoc-in [:tasks "t2"]
                               (assoc (running-task "t2" {}) :status :queued)))
           {dirs :directives state' :state}
           (c/default-policy [:repl/clear-throttle {:now 5000}] state)]
-      (is (nil? (:throttle-expires-at state')))
+      (is (empty? (:pool-throttle state')) "all pool windows lifted")
       (is (contains? (dir-types dirs) :execute))
       (is (= :running (get-in state' [:tasks "t2" :status]))))))
 
@@ -300,7 +320,7 @@
 
 (deftest throttled-submit-seeds-attempts
   (testing "a throttled submit is queued with ::attempts 1; a later transient failure increments cleanly (1.2)"
-    (let [throttled (assoc base-state :throttle-expires-at 10000)
+    (let [throttled (assoc base-state :pool-throttle {:default 10000})
           {s1 :state} (c/default-policy
                        [:submit {:task-id "t1" :context {} :closure (fn [] :ok)
                                  :submitted-at 0 :now 5000}] throttled)]
@@ -344,7 +364,7 @@
                        [:failed {:task-id "t2"
                                  :error (ex-info "rl" {:status 429 :retry-after 1000})
                                  :now 2000}] s1')]
-      (is (= 11000 (:throttle-expires-at s2))
+      (is (= 11000 (get-in s2 [:pool-throttle :default]))
           "kept the longer expiry (1000+10000), not the shorter (2000+1000)"))))
 
 (deftest decision-2-429-does-not-consume-attempts
@@ -384,6 +404,103 @@
                          [:failed {:task-id "t1" :error (ex-info "boom" {}) :now 1001}] s1)]
         (is (= :waiting-retry (get-in s2 [:tasks "t1" :status]))
             "retries instead of re-parking")))))
+
+;; =============================================================================
+;; Multi-resource pools: per-pool admission + throttle (pure) — RI 32
+;; =============================================================================
+
+(defn- pool-submit
+  "A :submit event tagging `pool`, with a monotonic :submitted-at from `i`."
+  [id pool i]
+  [:submit {:task-id id :context {:dj.concurrency/pool pool}
+            :closure (fn [] :ok) :submitted-at i :now 1000}])
+
+(deftest pool-caps-bound-each-pool-independently
+  (testing "each pool admits up to its OWN cap; excess queues (E7a per-pool admission)"
+    (let [state  (assoc base-state :pool-caps {:default :dj.concurrency/unbounded :llm-a 1 :llm-b 2})
+          events (concat (map #(pool-submit (str "a-" %) :llm-a %) (range 4))
+                         (map #(pool-submit (str "b-" %) :llm-b %) (range 4)))
+          st     (run-events c/default-policy state events)
+          by     (group-by (comp :dj.concurrency/pool :context) (vals (:tasks st)))]
+      (is (= 1 (running-count (:llm-a by))) "pool A bounded to cap 1")
+      (is (= 2 (running-count (:llm-b by))) "pool B bounded to cap 2 — simultaneously")
+      (is (= 3 (count (filter #(= :queued (:status %)) (:llm-a by)))) "A's excess waits")
+      (is (= 2 (count (filter #(= :queued (:status %)) (:llm-b by)))) "B's excess waits"))))
+
+(deftest throttle-isolation-per-pool
+  (testing "a 429 on pool A does NOT pause pool B (E7b, the §3 fix)"
+    (let [state (-> base-state
+                    (assoc :pool-caps {:default :dj.concurrency/unbounded :llm-a 1 :llm-b 1})
+                    (assoc-in [:tasks "a-0"]
+                              (assoc (running-task "a-0" {:dj.concurrency/pool :llm-a ::c/attempts 1})
+                                     :status :running)))
+          {s1 :state} (c/default-policy [:failed {:task-id "a-0"
+                                                  :error (ex-info "rl" {:status 429 :retry-after 60000})
+                                                  :now 1000}] state)]
+      (is (= 61000 (get-in s1 [:pool-throttle :llm-a])) "pool A throttled")
+      (is (nil? (get-in s1 [:pool-throttle :llm-b])) "pool B untouched")
+      ;; B admits while A is throttled…
+      (let [{dirs :directives s2 :state}
+            (c/default-policy (pool-submit "b-0" :llm-b 2) s1)]
+        (is (contains? (dir-types dirs) :execute) "pool B runs despite A's 429")
+        (is (= :running (get-in s2 [:tasks "b-0" :status])))
+        ;; …while a NEW pool-A submit stays queued (A still throttled).
+        (let [{s3 :state} (c/default-policy (pool-submit "a-1" :llm-a 3) s2)]
+          (is (= :queued (get-in s3 [:tasks "a-1" :status])) "pool A still throttled"))))))
+
+(deftest retry-reacquires-through-pool-gate
+  (testing "F11 per pool: a retry of a parked pool-A task re-enters A's gate, never leaking its cap (E7c)"
+    (let [state (-> base-state
+                    (assoc :pool-caps {:default :dj.concurrency/unbounded :llm-a 1})
+                    (assoc-in [:tasks "a-0"]
+                              (assoc (running-task "a-0" {:dj.concurrency/pool :llm-a ::c/attempts 1})
+                                     :status :running))
+                    (assoc-in [:tasks "a-1"]
+                              (assoc (running-task "a-1" {:dj.concurrency/pool :llm-a
+                                                          ::c/attempts 3 ::c/max-attempts 3})
+                                     :status :parked)))
+          ;; pool A is full (a-0 running); retrying a-1 must NOT bypass the cap.
+          {dirs :directives s1 :state} (c/default-policy [:repl/retry {:task-id "a-1" :now 1000}] state)]
+      (is (not (contains? (dir-types dirs) :execute)) "retry does not leak past the cap")
+      (is (= :queued (get-in s1 [:tasks "a-1" :status])) "re-enters the pool queue for a permit")
+      ;; a-0 resolves -> its permit frees -> retrying a-1 now admits (peak A never > 1).
+      (let [{s2 :state} (c/default-policy [:success {:task-id "a-0" :result :ok :now 1001}] state)
+            {s3 :state} (c/default-policy [:repl/retry {:task-id "a-1" :now 1002}] s2)]
+        (is (= :running (get-in s3 [:tasks "a-1" :status])) "admitted once the permit is free")))))
+
+(deftest set-pool-cap-updates-live-budget
+  (testing "set-pool-cap writes the bound into state; scan respects the new cap immediately"
+    (let [state (assoc base-state :pool-caps {:default :dj.concurrency/unbounded :llm-a 1})
+          s1    (run-events c/default-policy state
+                            (map #(pool-submit (str "a-" %) :llm-a %) (range 3)))]
+      (is (= 1 (running-count (vals (:tasks s1)))) "cap 1 -> 1 running, 2 queued")
+      ;; raise to 3 -> the 2 queued admit on the same pass
+      (let [{s2 :state} (c/default-policy [:repl/set-pool-cap {:pool :llm-a :cap 3 :now 1001}] s1)]
+        (is (= 3 (get-in s2 [:pool-caps :llm-a])) "cap updated in state")
+        (is (= 3 (running-count (vals (:tasks s2)))) "raising the cap admits the queued work")
+        ;; lower below in-flight -> nothing is cancelled; running tasks continue
+        (let [{s3 :state} (c/default-policy [:repl/set-pool-cap {:pool :llm-a :cap 1 :now 1002}] s2)]
+          (is (= 1 (get-in s3 [:pool-caps :llm-a])))
+          (is (= 3 (running-count (vals (:tasks s3))))
+              "lowering below current in-flight cancels nothing"))))))
+
+(deftest unknown-pool-warns-once
+  (testing "a submit to an undeclared pool runs unbounded and warns EXACTLY once"
+    (let [{d1 :directives s1 :state} (c/default-policy (pool-submit "t1" :typo 0) base-state)
+          {d2 :directives s2 :state} (c/default-policy (pool-submit "t2" :typo 1) s1)]
+      (is (= 1 (count (filter #{:unknown-pool} (log-events d1)))) "first submit warns")
+      (is (= :dj.concurrency/unbounded (get-in s1 [:pool-caps :typo]))
+          "the pool is registered unbounded, so the warn won't re-fire")
+      (is (zero? (count (filter #{:unknown-pool} (log-events d2)))) "second submit is silent")
+      (is (= :running (get-in s2 [:tasks "t1" :status])) "ran unbounded")
+      (is (= :running (get-in s2 [:tasks "t2" :status]))))))
+
+(deftest default-pool-never-warns
+  (testing "untagged work uses the pre-registered :default pool and never trips :unknown-pool"
+    (let [{dirs :directives} (c/default-policy
+                              [:submit {:task-id "t1" :context {} :closure (fn [] :ok)
+                                        :submitted-at 0 :now 1000}] base-state)]
+      (is (zero? (count (filter #{:unknown-pool} (log-events dirs))))))))
 
 ;; =============================================================================
 ;; Integration tests (live supervisor, real virtual threads)
@@ -462,8 +579,8 @@
           sup     (c/create-supervisor {:event-tap (fn [e] (swap! entries conj e))})]
       (try
         @(c/submit sup {} (fn [] :ok))
-        (is (wait-for #(some (fn [e] (= :submit-executed (:event e))) @entries))
-            "the :submit-executed entry was delivered to our event-tap")
+        (is (wait-for #(some (fn [e] (= :submit-queued (:event e))) @entries))
+            "the :submit-queued entry was delivered to our event-tap")
         (finally (c/stop! sup))))))
 
 (deftest wait-for-shutdown-blocks-until-stopped
@@ -535,6 +652,70 @@
             (is (= (c/state sup) (datafy/nav d :supervisor (:supervisor d)))
                 "nav :supervisor returns the full supervisor state")
             (is (= (c/state sup) (datafy/datafy sup)) "datafy of the supervisor is its state map")))
+        (finally (c/stop! sup))))))
+
+;; --- RI 32: per-pool concurrency, live ---
+
+(deftest pool-cap-bounds-real-concurrency
+  (testing "a live :pool-caps supervisor bounds real concurrent execution per pool"
+    (let [gate (CountDownLatch. 1)
+          cur  (atom 0)
+          peak (atom 0)
+          sup  (c/create-supervisor {:pool-caps {:llm-a 2}})
+          work (fn [] (swap! cur inc) (swap! peak max @cur)
+                 (.await gate) (swap! cur dec) :ok)]
+      (try
+        (let [fs (doall (repeatedly 5 #(c/submit sup {:dj.concurrency/pool :llm-a} work)))]
+          (is (wait-for #(= 2 @cur)) "exactly 2 run concurrently under cap 2")
+          (Thread/sleep 100)
+          (is (= 2 @peak) "never exceeded the cap while the gate held")
+          (.countDown gate)
+          (doseq [f fs] (is (= :ok (deref f 3000 :timed-out)) "every task eventually completes"))
+          (is (= 2 @peak) "peak stayed at the cap across the whole drain"))
+        (finally (c/stop! sup))))))
+
+(deftest set-pool-cap-live-raises-concurrency
+  (testing "set-pool-cap! retunes a pool's bound at runtime and unblocks queued work"
+    (let [gate (CountDownLatch. 1)
+          cur  (atom 0)
+          peak (atom 0)
+          sup  (c/create-supervisor {:pool-caps {:llm-a 1}})
+          work (fn [] (swap! cur inc) (swap! peak max @cur)
+                 (.await gate) (swap! cur dec) :ok)]
+      (try
+        (let [fs (doall (repeatedly 3 #(c/submit sup {:dj.concurrency/pool :llm-a} work)))]
+          (is (wait-for #(= 1 @cur)) "cap 1 -> 1 running")
+          (Thread/sleep 100)
+          (is (= 1 @peak) "held at 1 before the retune")
+          (is (= :queued (c/set-pool-cap! sup :llm-a 3)) "set-pool-cap! is fire-and-forget")
+          (is (wait-for #(= 3 @cur)) "raising the cap admits the queued work live")
+          (.countDown gate)
+          (doseq [f fs] (is (= :ok (deref f 3000 :timed-out)))))
+        (finally (c/stop! sup))))))
+
+(deftest throttle-isolation-live
+  (testing "a 429 on one pool does not stall another pool's throughput"
+    (let [a-calls (atom 0)
+          sup     (c/create-supervisor {:pool-caps {:llm-a 1 :llm-b 1}})]
+      (try
+        ;; pool A's task 429s on its FIRST call (long window) -> pool A throttled;
+        ;; a later retry succeeds.
+        (let [fa (c/submit sup {:dj.concurrency/pool :llm-a}
+                           (fn [] (if (= 1 (swap! a-calls inc))
+                                    (throw (ex-info "rl" {:status 429 :retry-after 60000}))
+                                    :a-ok)))]
+          (is (wait-for #(get-in (c/state sup) [:pool-throttle :llm-a]))
+              "pool A throttle window is set")
+          (is (nil? (get-in (c/state sup) [:pool-throttle :llm-b]))
+              "pool B is NOT throttled by A's 429")
+          ;; pool B runs immediately, unaffected by A's throttle
+          (is (= :ok (deref (c/submit sup {:dj.concurrency/pool :llm-b} (fn [] :ok))
+                            2000 :timed-out))
+              "pool B completes while pool A is throttled")
+          ;; clearing JUST pool A releases its task, which retries and succeeds
+          (c/clear-throttle sup :llm-a)
+          (is (= :a-ok (deref fa 2000 :timed-out))
+              "clear-throttle for :llm-a released A's task; it retried and succeeded"))
         (finally (c/stop! sup))))))
 
 ;; =============================================================================

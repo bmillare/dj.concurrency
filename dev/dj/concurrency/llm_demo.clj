@@ -73,10 +73,11 @@
 
 (defn demo-throttle-coordination [sup]
   (say "DEMO C: a 429 throttles the WHOLE supervisor; sibling requests queue, then drain")
-  (let [r1 (c/submit sup {:prompt "req-1"} (fake-llm "req-1" (atom [:rate :ok])))]
-    ;; Wait until the 429 has set the supervisor-wide throttle window.
-    (wait-for #(:throttle-expires-at (c/state sup)))
-    (say "throttle active? " (boolean (:throttle-expires-at (c/state sup))))
+  (let [r1 (c/submit sup {:prompt "req-1"} (fake-llm "req-1" (atom [:rate :ok])))
+        throttled? #(seq (:pool-throttle (c/state sup)))]  ;; untagged => :default pool
+    ;; Wait until the 429 has set the (default pool's) throttle window.
+    (wait-for throttled?)
+    (say "throttle active? " (boolean (throttled?)))
     (let [r2 (c/submit sup {:prompt "req-2"} (fake-llm "req-2" (atom [:ok])))
           r3 (c/submit sup {:prompt "req-3"} (fake-llm "req-3" (atom [:ok])))]
       ;; r2/r3 were submitted during the window -> they queue, not run.
