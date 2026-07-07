@@ -19,7 +19,7 @@
 ;; net.clojars.bmillare is auto-verified for the Clojars user `bmillare` (no
 ;; DNS / GitHub verification needed). See the Verified-Group-Names policy.
 (def lib 'net.clojars.bmillare/dj.concurrency)
-(def version "0.1.0-alpha1")
+(def version "0.1.0-alpha2")
 
 (def class-dir "target/classes")
 (def jar-file (format "target/%s-%s.jar" (name lib) version))

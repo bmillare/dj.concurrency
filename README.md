@@ -72,7 +72,7 @@ The library has **zero dependencies** (`:deps {}`). Dev tooling (a Nix flake + a
 Released to [Clojars](https://clojars.org/net.clojars.bmillare/dj.concurrency) (alpha — the API may still change):
 
 ```clojure
-net.clojars.bmillare/dj.concurrency {:mvn/version "0.1.0-alpha1"}
+net.clojars.bmillare/dj.concurrency {:mvn/version "0.1.0-alpha2"}
 ```
 
 Or track the bleeding edge straight from git:
