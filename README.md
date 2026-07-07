@@ -60,6 +60,44 @@ Imagine calling an LLM API (or any flaky external service) from the REPL. The *h
 
 Before long, your business logic is buried in retry and throttling code. Worse, a failure deep inside a long chain of requests throws an error and destroys all the work that successfully completed around it. 
 
+## Philosophy: fix forward, finish on the first run
+
+The three parts above serve one workflow, and it's worth stating plainly because
+it's the whole point:
+
+**Write the workflow straight — as if every call succeeds — and run it at the
+REPL.** You don't pre-plan for failure; you let it happen. When a call breaks, the
+task *parks* instead of crashing, and your workflow pauses at the `@` with **all
+its successful work intact**. Now you inspect the parked task, fix the actual cause
+— hot-reload the function, refresh a token, correct a prompt — and `(c/retry f)`.
+The blocked code resumes and the **same run drives to completion**. No restart, no
+re-running the 49 calls that already worked. The goal is to finish on the *first*
+run — not to crash, restart, and hope.
+
+This reframes the REPL from a console into your **development instrument**: you
+build a workflow by running it, watching where it parks (`parked-tasks`,
+`explain-stuck`, `task`), fixing forward, and resuming — until it runs clean once.
+By the time it has completed a single time, it's correct.
+
+**Two recovery modes, deliberately ranked:**
+
+- **Fix forward, live (the primary loop).** The process stays up; you fix the code
+  while the task is parked and resume. This is the dream above.
+- **Durable re-run (the safety net).** If the process *actually dies*, an opt-in
+  [durable memo table](README_AGENTS.md#durable-results--crash-recovery) lets you
+  re-run the same workflow and skip the work that already succeeded. This is
+  insurance for a real crash — **not** the expected path. Reach for it when
+  fix-forward isn't possible (the JVM is gone), not instead of it.
+
+**Unattended runs: write a co-supervisor — a robot stand-in for you.** When no one
+is at the REPL to service a park, you hand that job to a small
+[co-supervisor](README_AGENTS.md#reacting-to-events-co-supervision) that watches
+and acts in your place. Start as dumb as possible — *after a timeout, fail the task
+and log what happened* is a complete and useful v1 — and add smarts (retry budgets,
+no-progress detection) only when a real run demands them. The smartest supervisor
+is a human or agent at the REPL; a co-supervisor is just the automated,
+best-effort version of you for when you can't be there.
+
 ## Requirements
 
 - **JDK 21+** — uses virtual threads (`Thread/startVirtualThread`).

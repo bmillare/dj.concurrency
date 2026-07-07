@@ -6,6 +6,7 @@ detail for contributors, coding agents, and power users. It assumes you've read 
 main README's [payoff](README.md#the-payoff) and basic [usage](README.md#usage).
 
 Contents:
+- [The intended workflow: develop at the REPL, fix forward](#the-intended-workflow-develop-at-the-repl-fix-forward)
 - [Architecture: functional core + imperative shell](#architecture-functional-core--imperative-shell)
 - [Task lifecycle & statuses](#task-lifecycle--statuses)
 - [The deref contract (in full)](#the-deref-contract-in-full)
@@ -17,6 +18,83 @@ Contents:
 - [Customizing policy](#customizing-policy)
 - [API reference](#api-reference)
 - [Developing on this repo](#developing-on-this-repo)
+
+---
+
+## The intended workflow: develop at the REPL, fix forward
+
+Everything in this library is arranged around one development loop. The main README
+states the philosophy ([fix forward, finish on the first run](README.md#philosophy-fix-forward-finish-on-the-first-run));
+here is how it plays out in practice, and how to choose between the recovery modes.
+
+**The loop.**
+
+1. Write the workflow in **direct style** — plain `@`/`deref`, as if nothing fails.
+   No retry loops, no `try/catch` scaffolding, no failure branches.
+2. **Run it at the REPL.** Successful work resolves; the first genuine failure
+   *parks* its task (after exhausting retries) and the workflow pauses at the `@`,
+   holding every prior success.
+3. **Look.** `(explain-stuck sup)` for the one-line "what's parked and why";
+   `(task f)` / `(parked-tasks sup)` for the full context + error. The default loud
+   `:event-tap` has already printed the park to `*err*`, so you usually know before
+   you even ask.
+4. **Fix forward.** Correct the real cause — hot-reload the worker fn, fix a prompt,
+   refresh a credential, `(evict! sup key)` a stale memo — then `(retry f)` (re-run
+   the fixed fn) or `(deliver-result f v)` (inject a known-good value). The parked
+   `@` resumes; the run continues from where it stopped.
+5. Repeat until the run completes **once**. A workflow that has run to completion a
+   single time this way is one you've already debugged end-to-end.
+
+The REPL here is not an ops console bolted on after the fact — it's the instrument
+you *develop with*. Parking is what makes this possible: a failure deep in a chain
+doesn't unwind the stack and destroy the successful work around it, so the state you
+need to diagnose (and the results you don't want to recompute) are still sitting
+there when you arrive.
+
+### Fix-forward vs. durable re-run — when each applies
+
+Two recovery modes exist; they are not interchangeable.
+
+| | Fix forward (primary) | Durable re-run (safety net) |
+|---|---|---|
+| **When** | the process is still alive | the process actually died |
+| **Mechanism** | park → inspect → fix code → `retry`/`deliver-result` → resume | re-run the same workflow; `:store` hits resolve completed work instantly |
+| **Cost** | zero recompute; the same run finishes | re-run from the top, skipping only what's memoized |
+| **Role** | the dream: finish on the first run | insurance for a crash, not the expected path |
+
+Back the supervisor with a [durable memo table](#durable-results--crash-recovery) so
+that *if* the JVM dies you don't re-pay for 49 of 50 LLM calls — but the aim is never
+to need it. Fix-forward keeps you on the first run; the store only matters once that
+run's process is gone.
+
+### Unattended runs: a co-supervisor is you, automated
+
+The loop above assumes *you* are at the REPL to service a park. For a run that must
+proceed with no one watching — a scheduled job, a batch crawl — you write a
+**co-supervisor**: a small program that watches for parks and acts in your place. It
+is a stand-in for the human, so build it as the dumbest thing that captures what
+you'd actually do, and climb this ladder only as far as a real run forces you:
+
+1. **Dumbest, and often enough — timeout, fail, log.** Give each task an expected
+   deadline; if it parks (or a bounded `deref` times out), `abort` it and dump the
+   `explain-stuck` summary to your log. The run finishes with a clear record of what
+   failed instead of hanging forever. **Start here** — for many batch jobs this is
+   the whole co-supervisor.
+2. **Slightly smarter — react to progress.** Retry a park a bounded number of times,
+   or only while the task is still making progress, and escalate (abort + notify)
+   when it isn't. The [reference co-supervisor](#a-reference-co-supervisor-you-can-copy-dev)
+   is this tier: a per-task retry budget with a pluggable `:on-exhausted`.
+3. **Smartest — a human or agent at the REPL.** No automated policy beats a person
+   (or coding agent) who can read the error and *fix the code*. A co-supervisor buys
+   you unattended progress; it does not replace the fix-forward judgment of step 4
+   above. So when something it can't handle parks, the co-sup's real job is to
+   **surface it clearly** — a durable, legible record — so a human can fix forward
+   later, on the next run.
+
+Build correctness on the poll surface (`explain-stuck`, `tasks-by-status`), use the
+`:event-tap` only for latency, and keep the co-sup's action policy *yours* — see
+[Reacting to events](#reacting-to-events-co-supervision) for the mechanics and a
+copy-paste implementation.
 
 ---
 
